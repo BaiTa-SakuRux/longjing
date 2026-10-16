@@ -62,11 +62,21 @@ interface AppState {
   aiStreaming: boolean;
   /** 后端会话 id（backend → sessionId），切换后端即新会话 */
   backendSessions: Record<string, string>;
+
+  /** 主密码（仅内存，重启即失）；null = 未解锁 */
+  masterPassword: string | null;
+  securityMasterSet: boolean;
+  unlockSkipped: boolean;
   terminalSettings: TerminalSettings;
 
   transfers: TransferItem[];
 
   loadHosts: () => Promise<void>;
+  loadSecurityStatus: () => Promise<void>;
+  unlockMaster: (pw: string) => Promise<boolean>;
+  setupMaster: (pw: string) => Promise<void>;
+  clearMaster: (pw: string) => Promise<void>;
+  skipUnlock: () => void;
   loadProjects: () => Promise<void>;
   createProject: (name: string) => Promise<void>;
   renameProject: (oldName: string, newName: string) => Promise<void>;
@@ -120,11 +130,17 @@ function patchTab(tabId: number, patch: Partial<Tab>) {
 }
 
 /** 发起连接并把结果回写到对应标签 */
-async function startSession(tabId: number, session: TermSession, host: Host): Promise<void> {
+async function startSession(
+  tabId: number,
+  session: TermSession,
+  host: Host,
+  master: string | null,
+): Promise<void> {
   await session.connect(
     host.id,
     80,
     24,
+    master,
     (kind, fingerprint, message) => {
       useStore.setState({
         fingerprintPrompt: { host, fingerprint, message, changed: kind === "host_key_changed" },
@@ -176,13 +192,16 @@ export const useStore = create<AppState>((set, get) => ({
   aiContextChips: [],
   aiStreaming: false,
   backendSessions: {},
+  masterPassword: null,
+  securityMasterSet: false,
+  unlockSkipped: false,
   terminalSettings: { fontSize: 14, cursorBlink: true, scrollback: 5000 },
 
   transfers: [],
 
   loadHosts: async () => {
     try {
-      const hosts = await invoke<Host[]>("list_hosts");
+      const hosts = await invoke<Host[]>("list_hosts", { master: get().masterPassword });
       set({ hosts });
       const projects = await invoke<string[]>("list_projects");
       set({ projects });
@@ -190,6 +209,38 @@ export const useStore = create<AppState>((set, get) => ({
       console.error("加载主机列表失败", e);
     }
   },
+
+  loadSecurityStatus: async () => {
+    try {
+      const masterSet = await invoke<boolean>("security_status");
+      set({ securityMasterSet: masterSet });
+    } catch (e) {
+      console.error("读取安全状态失败", e);
+    }
+  },
+
+  unlockMaster: async (pw) => {
+    const ok = await invoke<boolean>("mp_verify", { password: pw });
+    if (ok) {
+      set({ masterPassword: pw, unlockSkipped: false });
+      await get().loadHosts();
+    }
+    return ok;
+  },
+
+  setupMaster: async (pw) => {
+    await invoke("mp_setup", { password: pw, currentMaster: get().masterPassword });
+    set({ masterPassword: pw, securityMasterSet: true, unlockSkipped: false });
+    await get().loadHosts();
+  },
+
+  clearMaster: async (pw) => {
+    await invoke("mp_clear", { password: pw });
+    set({ masterPassword: null, securityMasterSet: false });
+    await get().loadHosts();
+  },
+
+  skipUnlock: () => set({ unlockSkipped: true }),
 
   loadProjects: async () => {
     try {
@@ -254,7 +305,7 @@ export const useStore = create<AppState>((set, get) => ({
       filesOpen: false,
     };
     set((s) => ({ tabs: [...s.tabs, tab], activeTabId: tabId }));
-    void startSession(tabId, session, host);
+    void startSession(tabId, session, host, get().masterPassword);
   },
 
   retryTab: (tabId) => {
@@ -262,7 +313,7 @@ export const useStore = create<AppState>((set, get) => ({
     if (!tab) return;
     tab.session.reset();
     patchTab(tabId, { state: "connecting", errorMessage: undefined });
-    void startSession(tabId, tab.session, tab.host);
+    void startSession(tabId, tab.session, tab.host, get().masterPassword);
   },
 
   closeTab: (tabId) => {

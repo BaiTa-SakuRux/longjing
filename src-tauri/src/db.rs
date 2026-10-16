@@ -4,6 +4,8 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use crate::error::AppError;
+use crate::security::SecurityState;
+use crate::{crypto, security};
 
 pub struct Db(pub Mutex<Connection>);
 
@@ -170,18 +172,57 @@ pub fn save_known_fingerprint(conn: &Connection, addr: &str, fingerprint: &str) 
 }
 
 #[tauri::command]
-pub fn list_hosts(db: tauri::State<'_, Db>) -> Result<Vec<Host>, AppError> {
+pub fn list_hosts(
+    db: tauri::State<'_, Db>,
+    security: tauri::State<'_, SecurityState>,
+    master: Option<String>,
+) -> Result<Vec<Host>, AppError> {
     let conn = db.0.lock().unwrap();
     let mut stmt = conn.prepare("SELECT * FROM hosts ORDER BY id")?;
-    let hosts = stmt
+    let mut hosts = stmt
         .query_map([], host_from_row)?
         .collect::<Result<Vec<_>, _>>()?;
+    // 尽力解密；主密码未解锁时敏感字段返回空（前端编辑留空=保持不变）
+    match security::resolve_key(&security, &conn, master.as_deref()) {
+        Ok(key) => {
+            for h in &mut hosts {
+                if let Some(p) = &h.password {
+                    if crypto::is_encrypted(p) {
+                        h.password = crypto::decrypt_str(&key, p).ok();
+                    }
+                }
+                if let Some(k) = &h.key_passphrase {
+                    if crypto::is_encrypted(k) {
+                        h.key_passphrase = crypto::decrypt_str(&key, k).ok();
+                    }
+                }
+            }
+        }
+        Err(_) => {
+            for h in &mut hosts {
+                h.password = None;
+                h.key_passphrase = None;
+            }
+        }
+    }
     Ok(hosts)
 }
 
 #[tauri::command]
-pub fn add_host(db: tauri::State<'_, Db>, host: NewHost) -> Result<Host, AppError> {
+pub fn add_host(
+    db: tauri::State<'_, Db>,
+    security: tauri::State<'_, SecurityState>,
+    master: Option<String>,
+    host: NewHost,
+) -> Result<Host, AppError> {
     let conn = db.0.lock().unwrap();
+    let key = security::resolve_key(&security, &conn, master.as_deref())?;
+    let enc = |v: &Option<String>| -> Result<Option<String>, AppError> {
+        match v {
+            Some(s) if !s.is_empty() => Ok(Some(crypto::encrypt_str(&key, s)?)),
+            _ => Ok(None),
+        }
+    };
     conn.execute(
         "INSERT INTO hosts (name, host, port, username, auth_type, password, key_path, key_passphrase, project)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
@@ -191,9 +232,9 @@ pub fn add_host(db: tauri::State<'_, Db>, host: NewHost) -> Result<Host, AppErro
             host.port,
             host.username,
             host.auth_type,
-            host.password,
+            enc(&host.password)?,
             host.key_path,
-            host.key_passphrase,
+            enc(&host.key_passphrase)?,
             host.project.clone().unwrap_or_default(),
         ],
     )?;
@@ -201,19 +242,33 @@ pub fn add_host(db: tauri::State<'_, Db>, host: NewHost) -> Result<Host, AppErro
 }
 
 #[tauri::command]
-pub fn update_host(db: tauri::State<'_, Db>, host: Host) -> Result<(), AppError> {
+pub fn update_host(
+    db: tauri::State<'_, Db>,
+    security: tauri::State<'_, SecurityState>,
+    master: Option<String>,
+    host: Host,
+) -> Result<(), AppError> {
     let conn = db.0.lock().unwrap();
+    let key = security::resolve_key(&security, &conn, master.as_deref())?;
+    let enc = |v: &Option<String>| -> Result<Option<String>, AppError> {
+        match v {
+            Some(s) if !s.is_empty() && !crypto::is_encrypted(s) => {
+                Ok(Some(crypto::encrypt_str(&key, s)?))
+            }
+            _ => Ok(None), // 空 = 保持不变
+        }
+    };
     conn.execute(
-        "UPDATE hosts SET name=?1, host=?2, port=?3, username=?4, auth_type=?5, password=?6, key_path=?7, key_passphrase=?8, project=?9 WHERE id=?10",
+        "UPDATE hosts SET name=?1, host=?2, port=?3, username=?4, auth_type=?5, password=COALESCE(?6, password), key_path=?7, key_passphrase=COALESCE(?8, key_passphrase), project=?9 WHERE id=?10",
         rusqlite::params![
             host.name,
             host.host,
             host.port,
             host.username,
             host.auth_type,
-            host.password,
+            enc(&host.password)?,
             host.key_path,
-            host.key_passphrase,
+            enc(&host.key_passphrase)?,
             host.project,
             host.id,
         ],

@@ -1,7 +1,9 @@
 mod ai;
+mod crypto;
 mod db;
 mod error;
 mod local;
+mod security;
 mod sftp;
 mod ssh;
 
@@ -15,6 +17,7 @@ pub fn run() {
         .manage(db::Db(std::sync::Mutex::new(conn)))
         .manage(ssh::SshState::new())
         .manage(std::sync::Arc::new(ai::AiState::new()))
+        .manage(security::SecurityState::new())
         .manage(sftp::TransferState::new())
         .setup(|app| {
             #[cfg(desktop)]
@@ -35,6 +38,10 @@ pub fn run() {
             db::delete_project,
             db::get_setting,
             db::set_setting,
+            security::security_status,
+            security::mp_setup,
+            security::mp_clear,
+            security::mp_verify,
             ssh::ssh_connect,
             ssh::ssh_input,
             ssh::ssh_resize,

@@ -71,6 +71,18 @@ export function GearIcon({ className = "h-3.5 w-3.5" }: { className?: string }) 
   );
 }
 
+/** 安全（盾牌） */
+export function ShieldIcon({ className = "h-4 w-4" }: { className?: string }) {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" className={className} aria-hidden="true">
+      <path d="M12 3l7 3v5c0 5-3.2 8.4-7 10-3.8-1.6-7-5-7-10V6l7-3z" />
+      <path d="M9 12l2 2 4-4.5" />
+    </svg>
+  );
+}
+
+/** 安全（盾牌） */
+
 /** 外观（调节滑杆） */
 export function SlidersIcon({ className = "h-4 w-4" }: { className?: string }) {
   return (

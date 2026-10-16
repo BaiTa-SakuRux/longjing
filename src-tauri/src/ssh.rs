@@ -8,8 +8,10 @@ use std::time::Duration;
 use tauri::ipc::{Channel as IpcChannel, InvokeResponseBody};
 use tokio::sync::mpsc;
 
+use crate::crypto;
 use crate::db::{self, Db, Host};
 use crate::error::AppError;
+use crate::security::{self, SecurityState};
 
 /// 每个会话：SSH 连接句柄 + 控制 channel 的命令入口 + 惰性创建的 SFTP 会话
 struct SessionEntry {
@@ -102,17 +104,32 @@ fn classify_connect_error(
 #[tauri::command]
 pub async fn ssh_connect(
     ssh: tauri::State<'_, SshState>,
+    security: tauri::State<'_, SecurityState>,
     db: tauri::State<'_, Db>,
+    master: Option<String>,
     host_id: i64,
     cols: u32,
     rows: u32,
     on_event: IpcChannel,
 ) -> Result<u64, AppError> {
     // 取主机配置与已知指纹：锁不跨 await
-    let (host, known_fp) = {
+    let (mut host, known_fp) = {
         let conn = db.0.lock().unwrap();
-        let h = db::get_host(&conn, host_id)?;
+        let mut h = db::get_host(&conn, host_id)?;
         let fp = db::get_known_fingerprint(&conn, &db::addr_of(&h))?;
+        // 解密敏感字段（尽力：主密码未解锁时保持密文，认证会失败并提示解锁）
+        if let Ok(key) = security::resolve_key(&security, &conn, master.as_deref()) {
+            if let Some(p) = &h.password {
+                if crypto::is_encrypted(p) {
+                    h.password = crypto::decrypt_str(&key, p).ok();
+                }
+            }
+            if let Some(k) = &h.key_passphrase {
+                if crypto::is_encrypted(k) {
+                    h.key_passphrase = crypto::decrypt_str(&key, k).ok();
+                }
+            }
+        }
         (h, fp)
     };
 

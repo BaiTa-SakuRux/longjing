@@ -22,6 +22,7 @@ export class TermSession {
     hostId: number,
     cols: number,
     rows: number,
+    master: string | null,
     onUnknownHost: (
       kind: "unknown_host" | "host_key_changed",
       fingerprint: string,
@@ -62,6 +63,7 @@ export class TermSession {
         hostId,
         cols,
         rows,
+        master,
         onEvent: channel,
       });
     } catch (e) {

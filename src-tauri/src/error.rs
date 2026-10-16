@@ -56,6 +56,12 @@ impl From<russh_sftp::client::error::Error> for AppError {
     }
 }
 
+impl From<String> for AppError {
+    fn from(s: String) -> Self {
+        AppError::Other { message: s }
+    }
+}
+
 impl From<serde_json::Error> for AppError {
     fn from(e: serde_json::Error) -> Self {
         AppError::Other { message: e.to_string() }

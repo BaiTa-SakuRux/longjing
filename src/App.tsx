@@ -8,12 +8,14 @@ import { FingerprintModal } from "./components/FingerprintModal";
 import { AiPanel } from "./components/AiPanel";
 import { FileSidebar } from "./components/FileSidebar";
 import { SettingsModal } from "./components/SettingsModal";
+import { UnlockModal } from "./components/UnlockModal";
 import appIcon from "./assets/app-icon.png";
 
 export default function App() {
   const loadHosts = useStore((s) => s.loadHosts);
   const loadAiConfig = useStore((s) => s.loadAiConfig);
   const loadTerminalSettings = useStore((s) => s.loadTerminalSettings);
+  const loadSecurityStatus = useStore((s) => s.loadSecurityStatus);
   const hosts = useStore((s) => s.hosts);
   const tabs = useStore((s) => s.tabs);
   const activeTabId = useStore((s) => s.activeTabId);
@@ -26,7 +28,8 @@ export default function App() {
     void loadHosts();
     void loadAiConfig();
     void loadTerminalSettings();
-  }, [loadHosts, loadAiConfig, loadTerminalSettings]);
+    void loadSecurityStatus();
+  }, [loadHosts, loadAiConfig, loadTerminalSettings, loadSecurityStatus]);
 
   // 文件侧栏宽度（拖拽分隔条调整）
   const [filesWidth, setFilesWidth] = useState(440);
@@ -92,6 +95,7 @@ export default function App() {
       {hostForm && <HostFormModal />}
       <FingerprintModal />
       {settingsOpen && <SettingsModal />}
+      <UnlockModal />
     </div>
   );
 }

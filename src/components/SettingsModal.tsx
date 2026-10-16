@@ -3,9 +3,9 @@ import { invoke } from "@tauri-apps/api/core";
 import { open as fileDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { useStore } from "../store";
 import type { TerminalSettings } from "../types";
-import { AiSpark, ServerIcon, SlidersIcon } from "./icons";
+import { AiSpark, ServerIcon, ShieldIcon, SlidersIcon } from "./icons";
 
-type Page = "appearance" | "hosts" | "ai";
+type Page = "appearance" | "hosts" | "ai" | "security";
 
 export function SettingsModal() {
   // 由父组件条件挂载（打开时才 mount），初始页由 store 指定
@@ -17,6 +17,7 @@ export function SettingsModal() {
     appearance: "终端外观",
     hosts: "节点管理",
     ai: "智能核心",
+    security: "安全",
   };
 
   return (
@@ -30,6 +31,7 @@ export function SettingsModal() {
               ["appearance", "终端外观", <SlidersIcon key="i" className="h-4 w-4" />],
               ["hosts", "节点管理", <ServerIcon key="i" className="h-4 w-4" />],
               ["ai", "智能核心", <AiSpark key="i" className="h-4 w-4" />],
+              ["security", "安全", <ShieldIcon key="i" className="h-4 w-4" />],
             ] as const
           ).map(([p, label, icon]) => (
             <button
@@ -62,6 +64,7 @@ export function SettingsModal() {
             {page === "appearance" && <AppearancePane />}
             {page === "hosts" && <HostsPane />}
             {page === "ai" && <AiPane />}
+            {page === "security" && <SecurityPane />}
           </div>
         </div>
       </div>
@@ -401,8 +404,9 @@ const PRESETS = [
   ["DeepSeek", "https://api.deepseek.com", "deepseek-flash"],
 ] as const;
 
-const DEFAULT_ZCODE_PATH = ""; // 留空自动探测常见安装位置
-const DEFAULT_DSH_PATH = ""; // 留空自动探测常见安装位置
+const DEFAULT_ZCODE_PATH = "D:/byxhw/INSTALL/ZCode/resources/glm/zcode.cjs";
+const DEFAULT_DSH_PATH =
+  "C:/Users/byxhw/AppData/Local/Programs/DeepSeek Harness/resources/runtime/cli/bin/dsh.cmd";
 
 const BACKEND_OPTIONS: { id: Backend; label: string; desc: string }[] = [
   { id: "api", label: "自定义 API", desc: "OpenAI 兼容端点，填 baseURL + API Key" },
@@ -708,5 +712,170 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
       <span className="mb-1 block text-xs text-neutral-400">{label}</span>
       {children}
     </label>
+  );
+}
+
+/* ================= 安全 ================= */
+
+function SecurityPane() {
+  const securityMasterSet = useStore((s) => s.securityMasterSet);
+  const setupMaster = useStore((s) => s.setupMaster);
+  const clearMaster = useStore((s) => s.clearMaster);
+
+  const [pw, setPw] = useState("");
+  const [confirm, setConfirm] = useState("");
+  const [clearPw, setClearPw] = useState("");
+  const [error, setError] = useState("");
+  const [saved, setSaved] = useState(false);
+  const [cleared, setCleared] = useState(false);
+  const [busy, setBusy] = useState(false);
+
+  async function doSetup() {
+    if (pw.length < 6) {
+      setError("主密码至少 6 个字符");
+      return;
+    }
+    if (pw !== confirm) {
+      setError("两次输入的密码不一致");
+      return;
+    }
+    setBusy(true);
+    setError("");
+    try {
+      await setupMaster(pw);
+      setSaved(true);
+      setPw("");
+      setConfirm("");
+      setTimeout(() => setSaved(false), 1800);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function doClear() {
+    if (!clearPw) {
+      setError("请输入当前主密码");
+      return;
+    }
+    setBusy(true);
+    setError("");
+    try {
+      await clearMaster(clearPw);
+      setCleared(true);
+      setClearPw("");
+      setTimeout(() => setCleared(false), 1800);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="max-w-md space-y-4">
+      <div
+        className={`rounded-md border px-3 py-2 text-sm ${
+          securityMasterSet
+            ? "border-emerald-800 bg-emerald-900/20 text-emerald-300"
+            : "border-neutral-800 bg-neutral-950 text-neutral-400"
+        }`}
+      >
+        {securityMasterSet
+          ? "✓ 已启用主密码加密（AES-256-GCM + PBKDF2）"
+          : "未设置主密码（当前为系统级加密：密钥受 Windows 凭据管理器保护）"}
+      </div>
+
+      {!securityMasterSet ? (
+        <>
+          <p className="text-[11px] leading-relaxed text-neutral-500">
+            设置主密码后，敏感信息改由主密码派生密钥加密，每次启动需输入主密码解锁一次。
+            不设置则使用系统级加密（无感知）。
+          </p>
+          <Field label="新主密码（至少 6 位）">
+            <input
+              type="password"
+              className={inputCls}
+              value={pw}
+              onChange={(e) => setPw(e.target.value)}
+            />
+          </Field>
+          <Field label="确认新主密码">
+            <input
+              type="password"
+              className={inputCls}
+              value={confirm}
+              onChange={(e) => setConfirm(e.target.value)}
+            />
+          </Field>
+        </>
+      ) : (
+        <>
+          <p className="text-[11px] leading-relaxed text-neutral-500">
+            更改主密码会自动重加密全部敏感信息；清除主密码则回到系统级加密。
+          </p>
+          <Field label="新主密码（留空 = 保持当前）">
+            <input
+              type="password"
+              className={inputCls}
+              value={pw}
+              onChange={(e) => setPw(e.target.value)}
+            />
+          </Field>
+          <Field label="确认新主密码">
+            <input
+              type="password"
+              className={inputCls}
+              value={confirm}
+              onChange={(e) => setConfirm(e.target.value)}
+            />
+          </Field>
+          <Field label="当前主密码（清除时必填）">
+            <input
+              type="password"
+              className={inputCls}
+              value={clearPw}
+              onChange={(e) => setClearPw(e.target.value)}
+            />
+          </Field>
+        </>
+      )}
+
+      {error && <p className="text-xs text-rose-400">{error}</p>}
+
+      <div className="flex gap-2">
+        {!securityMasterSet ? (
+          <button
+            onClick={() => void doSetup()}
+            disabled={busy}
+            className="rounded-md bg-sky-600 px-4 py-1.5 text-sm text-white hover:bg-sky-500 disabled:opacity-50"
+          >
+            {busy ? "处理中…" : saved ? "✓ 已设置" : "设置主密码"}
+          </button>
+        ) : (
+          <>
+            {(pw || confirm) && (
+              <button
+                onClick={() => void doSetup()}
+                disabled={busy || !pw}
+                className="rounded-md bg-sky-600 px-4 py-1.5 text-sm text-white hover:bg-sky-500 disabled:opacity-50"
+              >
+                {busy ? "处理中…" : saved ? "✓ 已更改" : "更改主密码"}
+              </button>
+            )}
+            {clearPw && (
+              <button
+                onClick={() => void doClear()}
+                disabled={busy}
+                className="rounded-md border border-rose-700 px-4 py-1.5 text-sm text-rose-400 hover:bg-rose-900/30 disabled:opacity-50"
+              >
+                {cleared ? "✓ 已清除" : "清除主密码"}
+              </button>
+            )}
+          </>
+        )}
+      </div>
+    </div>
   );
 }
