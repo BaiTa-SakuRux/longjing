@@ -61,7 +61,7 @@ pub fn resolve_key(
     }
     let master = master
         .filter(|m| !m.is_empty())
-        .ok_or_else(|| AppError::other("需要主密码解锁（重启后首次访问需输入）"))?;
+        .ok_or(AppError::MasterLocked)?;
     let key = derive_master_key(conn, master)?;
     security.cache_key(key);
     Ok(key)

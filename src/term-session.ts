@@ -28,7 +28,7 @@ export class TermSession {
       fingerprint: string,
       message: string,
     ) => void,
-    onError: (message: string) => void,
+    onError: (message: string, kind?: string) => void,
     onClosed: () => void,
   ): Promise<void> {
     const channel = new Channel<ArrayBuffer | string | { event?: string }>();
@@ -74,7 +74,7 @@ export class TermSession {
       ) {
         onUnknownHost(err.kind, err.fingerprint, err.message);
       }
-      onError(err.message);
+      onError(err.message, err.kind);
     }
   }
 

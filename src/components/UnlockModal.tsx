@@ -6,15 +6,20 @@ import { ShieldIcon } from "./icons";
 export function UnlockModal() {
   const securityMasterSet = useStore((s) => s.securityMasterSet);
   const masterPassword = useStore((s) => s.masterPassword);
-  const unlockSkipped = useStore((s) => s.unlockSkipped);
+  const unlockDismissed = useStore((s) => s.unlockDismissed);
+  const pendingConnect = useStore((s) => s.pendingConnect);
   const unlockMaster = useStore((s) => s.unlockMaster);
   const skipUnlock = useStore((s) => s.skipUnlock);
+  const resumePendingConnect = useStore((s) => s.resumePendingConnect);
 
   const [pw, setPw] = useState("");
   const [err, setErr] = useState("");
   const [busy, setBusy] = useState(false);
 
-  if (!securityMasterSet || masterPassword !== null || unlockSkipped) return null;
+  // 有待续连的连接请求时，即使之前点过「稍后再说」也强制弹出
+  if (!securityMasterSet || masterPassword !== null || (unlockDismissed && !pendingConnect)) {
+    return null;
+  }
 
   async function submit() {
     if (!pw || busy) return;
@@ -24,6 +29,8 @@ export function UnlockModal() {
     if (!ok) {
       setErr("主密码错误");
       setBusy(false);
+    } else {
+      resumePendingConnect();
     }
   }
 

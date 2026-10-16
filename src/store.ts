@@ -66,7 +66,9 @@ interface AppState {
   /** 主密码（仅内存，重启即失）；null = 未解锁 */
   masterPassword: string | null;
   securityMasterSet: boolean;
-  unlockSkipped: boolean;
+  unlockDismissed: boolean;
+  /** 主密码锁定时暂存的连接请求，解锁后自动续连 */
+  pendingConnect: { tabId: number; session: TermSession; host: Host } | null;
   terminalSettings: TerminalSettings;
 
   transfers: TransferItem[];
@@ -77,6 +79,7 @@ interface AppState {
   setupMaster: (pw: string) => Promise<void>;
   clearMaster: (pw: string) => Promise<void>;
   skipUnlock: () => void;
+  resumePendingConnect: () => void;
   loadProjects: () => Promise<void>;
   createProject: (name: string) => Promise<void>;
   renameProject: (oldName: string, newName: string) => Promise<void>;
@@ -146,7 +149,16 @@ async function startSession(
         fingerprintPrompt: { host, fingerprint, message, changed: kind === "host_key_changed" },
       });
     },
-    (message) => patchTab(tabId, { state: "error", errorMessage: message }),
+    (message, kind) => {
+      if (kind === "master_locked") {
+        // 主密码锁定：暂存连接请求并弹出解锁框，解锁后自动续连
+        useStore.setState((s) => ({
+          pendingConnect: s.pendingConnect ?? { tabId, session, host },
+          unlockDismissed: false,
+        }));
+      }
+      patchTab(tabId, { state: "error", errorMessage: message });
+    },
     () => patchTab(tabId, { state: "closed" }),
   );
   // connect 正常返回（无抛错）即已建立会话；若中途已转为 error 则不覆盖
@@ -194,7 +206,8 @@ export const useStore = create<AppState>((set, get) => ({
   backendSessions: {},
   masterPassword: null,
   securityMasterSet: false,
-  unlockSkipped: false,
+  unlockDismissed: false,
+  pendingConnect: null,
   terminalSettings: { fontSize: 14, cursorBlink: true, scrollback: 5000 },
 
   transfers: [],
@@ -222,15 +235,16 @@ export const useStore = create<AppState>((set, get) => ({
   unlockMaster: async (pw) => {
     const ok = await invoke<boolean>("mp_verify", { password: pw });
     if (ok) {
-      set({ masterPassword: pw, unlockSkipped: false });
+      set({ masterPassword: pw });
       await get().loadHosts();
+      get().resumePendingConnect();
     }
     return ok;
   },
 
   setupMaster: async (pw) => {
     await invoke("mp_setup", { password: pw, currentMaster: get().masterPassword });
-    set({ masterPassword: pw, securityMasterSet: true, unlockSkipped: false });
+    set({ masterPassword: pw, securityMasterSet: true, unlockDismissed: false });
     await get().loadHosts();
   },
 
@@ -240,7 +254,14 @@ export const useStore = create<AppState>((set, get) => ({
     await get().loadHosts();
   },
 
-  skipUnlock: () => set({ unlockSkipped: true }),
+  skipUnlock: () => set({ unlockDismissed: true }),
+  resumePendingConnect: () => {
+    const p = get().pendingConnect;
+    if (!p) return;
+    set({ pendingConnect: null });
+    patchTab(p.tabId, { state: "connecting", errorMessage: undefined });
+    void startSession(p.tabId, p.session, p.host, get().masterPassword);
+  },
 
   loadProjects: async () => {
     try {

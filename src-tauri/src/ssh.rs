@@ -117,17 +117,16 @@ pub async fn ssh_connect(
         let conn = db.0.lock().unwrap();
         let mut h = db::get_host(&conn, host_id)?;
         let fp = db::get_known_fingerprint(&conn, &db::addr_of(&h))?;
-        // 解密敏感字段（尽力：主密码未解锁时保持密文，认证会失败并提示解锁）
-        if let Ok(key) = security::resolve_key(&security, &conn, master.as_deref()) {
-            if let Some(p) = &h.password {
-                if crypto::is_encrypted(p) {
-                    h.password = crypto::decrypt_str(&key, p).ok();
-                }
+        // 解密敏感字段；未解锁时返回 MasterLocked 让前端弹解锁框
+        let key = security::resolve_key(&security, &conn, master.as_deref())?;
+        if let Some(p) = &h.password {
+            if crypto::is_encrypted(p) {
+                h.password = Some(crypto::decrypt_str(&key, p)?);
             }
-            if let Some(k) = &h.key_passphrase {
-                if crypto::is_encrypted(k) {
-                    h.key_passphrase = crypto::decrypt_str(&key, k).ok();
-                }
+        }
+        if let Some(k) = &h.key_passphrase {
+            if crypto::is_encrypted(k) {
+                h.key_passphrase = Some(crypto::decrypt_str(&key, k)?);
             }
         }
         (h, fp)

@@ -831,7 +831,7 @@ function SecurityPane() {
               onChange={(e) => setConfirm(e.target.value)}
             />
           </Field>
-          <Field label="当前主密码（清除时必填）">
+          <Field label="当前主密码（取消加密时必填）">
             <input
               type="password"
               className={inputCls}
@@ -855,24 +855,20 @@ function SecurityPane() {
           </button>
         ) : (
           <>
-            {(pw || confirm) && (
-              <button
-                onClick={() => void doSetup()}
-                disabled={busy || !pw}
-                className="rounded-md bg-sky-600 px-4 py-1.5 text-sm text-white hover:bg-sky-500 disabled:opacity-50"
-              >
-                {busy ? "处理中…" : saved ? "✓ 已更改" : "更改主密码"}
-              </button>
-            )}
-            {clearPw && (
-              <button
-                onClick={() => void doClear()}
-                disabled={busy}
-                className="rounded-md border border-rose-700 px-4 py-1.5 text-sm text-rose-400 hover:bg-rose-900/30 disabled:opacity-50"
-              >
-                {cleared ? "✓ 已清除" : "清除主密码"}
-              </button>
-            )}
+            <button
+              onClick={() => void doSetup()}
+              disabled={busy || !pw}
+              className="rounded-md bg-sky-600 px-4 py-1.5 text-sm text-white hover:bg-sky-500 disabled:opacity-50"
+            >
+              {busy ? "处理中…" : saved ? "✓ 已更改" : "更改主密码"}
+            </button>
+            <button
+              onClick={() => void doClear()}
+              disabled={busy || !clearPw}
+              className="rounded-md border border-rose-700 px-4 py-1.5 text-sm text-rose-400 hover:bg-rose-900/30 disabled:opacity-50"
+            >
+              {cleared ? "✓ 已取消加密" : "取消加密（恢复系统级）"}
+            </button>
           </>
         )}
       </div>
