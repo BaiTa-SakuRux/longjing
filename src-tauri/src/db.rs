@@ -7,14 +7,26 @@ use crate::error::AppError;
 
 pub struct Db(pub Mutex<Connection>);
 
-/// 运行时数据目录：编译期常量指向项目 data\，支持 LONGJING_DATA_DIR 环境变量覆盖
+/// 运行时数据目录（优先级）：LONGJING_DATA_DIR 环境变量 > exe 同目录 data\ > %APPDATA%\longjing
 pub fn data_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("LONGJING_DATA_DIR") {
         return PathBuf::from(dir);
     }
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("data")
+    // 绿色版惯例：数据放在 exe 旁边，便于整个目录拷走
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let d = dir.join("data");
+            if std::fs::create_dir_all(&d).is_ok() {
+                return d;
+            }
+        }
+    }
+    // 回退：用户数据目录
+    let d = std::env::var("APPDATA")
+        .map(|a| PathBuf::from(a).join("longjing"))
+        .unwrap_or_else(|_| PathBuf::from("data"));
+    let _ = std::fs::create_dir_all(&d);
+    d
 }
 
 pub fn init() -> Result<Connection, AppError> {
