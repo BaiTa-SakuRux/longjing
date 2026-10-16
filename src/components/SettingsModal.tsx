@@ -17,7 +17,7 @@ export function SettingsModal() {
     appearance: "终端外观",
     hosts: "节点管理",
     ai: "智能核心",
-    security: "安全中心",
+    security: "隐私加密",
   };
 
   return (
@@ -31,7 +31,7 @@ export function SettingsModal() {
               ["appearance", "终端外观", <SlidersIcon key="i" className="h-4 w-4" />],
               ["hosts", "节点管理", <ServerIcon key="i" className="h-4 w-4" />],
               ["ai", "智能核心", <AiSpark key="i" className="h-4 w-4" />],
-              ["security", "安全中心", <ShieldIcon key="i" className="h-4 w-4" />],
+              ["security", "隐私加密", <ShieldIcon key="i" className="h-4 w-4" />],
             ] as const
           ).map(([p, label, icon]) => (
             <button
