@@ -1,4 +1,4 @@
-# 🐋 龙鲸X（LongjingX）
+# <img src="src/assets/app-icon.png" width="32" align="top" alt="龙鲸X"> 龙鲸X（LongjingX）
 
 > 自用 SSH 运维工作台 + AI 助手：多标签终端、多主机 AI 协同、SFTP 文件管理，装进一个绿色可执行文件。
 
