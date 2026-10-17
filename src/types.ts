@@ -9,12 +9,19 @@ export interface Host {
   password: string | null;
   key_path: string | null;
   key_passphrase: string | null;
-  /** 项目分组（空串 = 未分组） */
+  /** 项目分组（空串 = 默认项目） */
   project: string;
 }
 
 /** 新增/编辑主机时的载荷（id 除外） */
 export type NewHost = Omit<Host, "id">;
+
+/** 快捷指令（终端一键发送） */
+export interface Snippet {
+  id: number;
+  name: string;
+  command: string;
+}
 
 export type ConnState = "connecting" | "connected" | "error" | "closed";
 
@@ -42,6 +49,8 @@ export interface TerminalSettings {
   fontSize: number;
   cursorBlink: boolean;
   scrollback: number;
+  /** 快捷粘贴：选中即复制、右键直接粘贴（默认开；关 = xterm 默认右键菜单） */
+  quickPaste: boolean;
 }
 
 /** Rust AppError 的 serde JSON 形态（tag = kind） */

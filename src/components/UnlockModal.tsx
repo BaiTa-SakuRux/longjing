@@ -25,12 +25,18 @@ export function UnlockModal() {
     if (!pw || busy) return;
     setBusy(true);
     setErr("");
-    const ok = await unlockMaster(pw);
-    if (!ok) {
-      setErr("主密码错误");
+    try {
+      const ok = await unlockMaster(pw);
+      if (!ok) {
+        setErr("主密码错误");
+        setBusy(false);
+      } else {
+        resumePendingConnect();
+      }
+    } catch (e) {
+      // invoke 层异常（数据库异常等）：必须复位 busy，否则按钮永远停在「验证中…」
+      setErr(`解锁失败：${String(e)}`);
       setBusy(false);
-    } else {
-      resumePendingConnect();
     }
   }
 

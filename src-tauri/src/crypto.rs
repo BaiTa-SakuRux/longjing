@@ -5,7 +5,7 @@
 
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
-use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM};
+use ring::aead::{Aad, Algorithm, LessSafeKey, Nonce, UnboundKey, AES_256_GCM, CHACHA20_POLY1305};
 use ring::pbkdf2;
 use ring::rand::SecureRandom;
 use std::num::NonZeroU32;
@@ -72,7 +72,9 @@ pub fn encrypt(key: &Key32, plain: &[u8]) -> Result<String, String> {
     Ok(format!("{}{}", PREFIX, B64.encode(packed)))
 }
 
-/// 解密 `enc:v1:` 前缀的密文
+/// 解密 `enc:v1:` 前缀的密文。存储布局为 `nonce ‖ tag ‖ ciphertext`，
+/// 而 ring 的 `open_in_place` 要求 `ciphertext ‖ tag`，须重排后再校验；
+/// 同时容忍历史上 ChaCha20-Poly1305 写出的密文（同样布局）。
 pub fn decrypt(key: &Key32, stored: &str) -> Result<Vec<u8>, String> {
     let data = stored
         .strip_prefix(PREFIX)
@@ -81,18 +83,23 @@ pub fn decrypt(key: &Key32, stored: &str) -> Result<Vec<u8>, String> {
     if raw.len() < NONCE_LEN + TAG_LEN {
         return Err("密文过短".to_string());
     }
-    let (nonce_bytes, ct) = raw.split_at(NONCE_LEN);
-    let unbound = UnboundKey::new(&AES_256_GCM, key).map_err(|e| e.to_string())?;
-    let opening = LessSafeKey::new(unbound);
-    let nonce = Nonce::try_assume_unique_for_key(
-        nonce_bytes.try_into().map_err(|_| "nonce 长度错误".to_string())?,
-    )
-    .map_err(|e| e.to_string())?;
-    let mut in_out = ct.to_vec();
-    opening
-        .open_in_place(nonce, Aad::empty(), &mut in_out)
-        .map_err(|_| "解密失败（主密码错误或数据损坏）".to_string())?;
-    Ok(in_out)
+    let nonce_bytes: [u8; NONCE_LEN] = raw[..NONCE_LEN]
+        .try_into()
+        .map_err(|_| "nonce 长度错误".to_string())?;
+    let tag = &raw[NONCE_LEN..NONCE_LEN + TAG_LEN];
+    let algs: [&Algorithm; 2] = [&AES_256_GCM, &CHACHA20_POLY1305];
+    for alg in algs {
+        let unbound = UnboundKey::new(alg, key).map_err(|e| e.to_string())?;
+        let mut in_out = raw[NONCE_LEN + TAG_LEN..].to_vec();
+        in_out.extend_from_slice(tag);
+        let opening = LessSafeKey::new(unbound);
+        let nonce =
+            Nonce::try_assume_unique_for_key(&nonce_bytes).map_err(|e| e.to_string())?;
+        if let Ok(plain) = opening.open_in_place(nonce, Aad::empty(), &mut in_out) {
+            return Ok(plain.to_vec());
+        }
+    }
+    Err("解密失败（主密码错误或数据损坏）".to_string())
 }
 
 /// 加密明文字符串（空值原样返回）
@@ -113,4 +120,69 @@ pub fn decrypt_str(key: &Key32, stored: &str) -> Result<String, String> {
     }
     let bytes = decrypt(key, stored)?;
     Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn aes_roundtrip_minimal() {
+        let key = [42u8; 32];
+        let ct = encrypt(&key, b"hello world").unwrap();
+        eprintln!("[T1] ct={}", ct);
+        let pt = decrypt(&key, &ct).unwrap();
+        assert_eq!(pt, b"hello world");
+    }
+
+    #[test]
+    fn aes_roundtrip_random_key() {
+        let key = random_key().unwrap();
+        let mut fail = 0;
+        for i in 0..200 {
+            let msg = format!("message-{i}");
+            let ct = encrypt(&key, msg.as_bytes()).unwrap();
+            let pt = decrypt(&key, &ct).unwrap();
+            if pt != msg.as_bytes() {
+                fail += 1;
+            }
+        }
+        eprintln!("[RATE] 200 次回环失败 {} 次", fail);
+        assert_eq!(fail, 0, "回环解密失败");
+    }
+
+    #[test]
+    fn decrypt_tolerates_legacy_chacha() {
+        let key = [7u8; 32];
+        // 手工构造 ChaCha20-Poly1305、与 encrypt 相同布局的密文（历史上误切算法时期写出的格式）
+        let unbound = UnboundKey::new(&CHACHA20_POLY1305, &key).unwrap();
+        let sealing = LessSafeKey::new(unbound);
+        let nonce_bytes = random_nonce().unwrap();
+        let mut in_out = b"legacy secret".to_vec();
+        let tag = sealing
+            .seal_in_place_separate_tag(
+                Nonce::assume_unique_for_key(nonce_bytes),
+                Aad::empty(),
+                &mut in_out,
+            )
+            .unwrap();
+        let mut packed = Vec::new();
+        packed.extend_from_slice(&nonce_bytes);
+        packed.extend_from_slice(tag.as_ref());
+        packed.extend_from_slice(&in_out);
+        let stored = format!("{}{}", PREFIX, B64.encode(packed));
+        assert_eq!(decrypt(&key, &stored).unwrap(), b"legacy secret");
+    }
+
+    #[test]
+    fn derive_is_deterministic() {
+        let salt = [
+            1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
+        ];
+        let k1 = derive_key("same-password", &salt);
+        let k2 = derive_key("same-password", &salt);
+        assert_eq!(k1, k2);
+        let k3 = derive_key("other-password", &salt);
+        assert_ne!(k1, k3);
+    }
 }

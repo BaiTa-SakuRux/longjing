@@ -1,6 +1,7 @@
 import { useEffect, useRef } from "react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
+import { readText, writeText } from "@tauri-apps/plugin-clipboard-manager";
 import type { Tab } from "../types";
 import { useStore } from "../store";
 import { registerTerminal, unregisterTerminal } from "../terminal-registry";
@@ -48,6 +49,23 @@ export function TerminalView({ tab, active }: { tab: Tab; active: boolean }) {
     const detach = tab.session.attach((data) => term.write(data));
     const dataSub = term.onData((d) => tab.session.write(encoder.encode(d)));
     const resizeSub = term.onResize(({ cols, rows }) => tab.session.resize(cols, rows));
+
+    // 快捷粘贴：选中即复制、右键直接粘贴（设置 → 终端设置可关闭）
+    const quickPasteOn = () => useStore.getState().terminalSettings.quickPaste !== false;
+    const selSub = term.onSelectionChange(() => {
+      if (!quickPasteOn()) return;
+      const sel = term.getSelection();
+      if (sel) void writeText(sel).catch(() => {});
+    });
+    const onContextMenu = (e: MouseEvent) => {
+      if (!quickPasteOn()) return; // 关闭时保留浏览器默认右键菜单
+      e.preventDefault();
+      void readText()
+        .then((t) => term.paste(t))
+        .catch(() => {});
+    };
+    container.addEventListener("contextmenu", onContextMenu);
+
     const offClosed = tab.session.onClosed(() => {
       term.write("\r\n\x1b[90m\x1b[2m—— 连接已断开 ——\x1b[0m\r\n");
     });
@@ -71,6 +89,8 @@ export function TerminalView({ tab, active }: { tab: Tab; active: boolean }) {
       detach();
       dataSub.dispose();
       resizeSub.dispose();
+      selSub.dispose();
+      container.removeEventListener("contextmenu", onContextMenu);
       unregisterTerminal(tab.id);
       term.dispose();
       termRef.current = null;

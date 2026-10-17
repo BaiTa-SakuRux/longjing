@@ -9,10 +9,13 @@ use std::time::Duration;
 use tauri::ipc::{Channel as IpcChannel, InvokeResponseBody};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
+use rusqlite::Connection;
 use tokio::sync::Mutex as AsyncMutex;
 
+use crate::crypto;
 use crate::db::Db;
 use crate::error::AppError;
+use crate::security::{self, SecurityState};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AiConfig {
@@ -37,6 +40,9 @@ pub struct AiConfig {
     /// dsh.cmd 完整路径
     #[serde(default)]
     pub dsh_path: String,
+    /// dsh 会话归属工作目录（空 = 项目目录）
+    #[serde(default)]
+    pub dsh_cwd: String,
 }
 
 fn default_backend() -> String {
@@ -89,14 +95,56 @@ fn settings_set(conn: &rusqlite::Connection, key: &str, value: &str) -> Result<(
 }
 
 #[tauri::command]
-pub fn ai_get_config(db: tauri::State<'_, Db>) -> Result<Option<AiConfig>, AppError> {
+pub fn ai_get_config(
+    db: tauri::State<'_, Db>,
+    security: tauri::State<'_, SecurityState>,
+    master: Option<String>,
+) -> Result<Option<AiConfig>, AppError> {
     let conn = db.0.lock().unwrap();
-    Ok(settings_get(&conn, "ai").and_then(|v| serde_json::from_str(&v).ok()))
+    let mut config = settings_get(&conn, "ai").and_then(|v| serde_json::from_str::<AiConfig>(&v).ok());
+    if let (Some(cfg), Some(key)) = (config.as_mut(), resolve_api_key(&security, &conn, master.as_deref())?) {
+        cfg.api_key = key;
+    }
+    Ok(config)
+}
+
+/// 从存储中解析 AI API Key（未加密时原样；加密时用密钥解密；无法解密返回空）
+fn resolve_api_key(
+    security: &SecurityState,
+    conn: &Connection,
+    master: Option<&str>,
+) -> Result<Option<String>, AppError> {
+    let raw = settings_get(conn, "ai")
+        .and_then(|v| serde_json::from_str::<AiConfig>(&v).ok())
+        .map(|c| c.api_key)
+        .unwrap_or_default();
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    if !crypto::is_encrypted(&raw) {
+        return Ok(Some(raw));
+    }
+    let key = security::resolve_key(security, conn, master)?;
+    Ok(Some(crypto::decrypt_str(&key, &raw)?))
 }
 
 #[tauri::command]
-pub fn ai_save_config(db: tauri::State<'_, Db>, config: AiConfig) -> Result<(), AppError> {
+pub fn ai_save_config(
+    security: tauri::State<'_, SecurityState>,
+    db: tauri::State<'_, Db>,
+    master: Option<String>,
+    mut config: AiConfig,
+) -> Result<(), AppError> {
     let conn = db.0.lock().unwrap();
+    // api_key 留空 = 保持已存值不变
+    if config.api_key.trim().is_empty() {
+        if let Some(old) = settings_get(&conn, "ai").and_then(|v| serde_json::from_str::<AiConfig>(&v).ok()) {
+            config.api_key = old.api_key;
+        }
+    } else if !crypto::is_encrypted(&config.api_key) {
+        let key = security::resolve_key(&security, &conn, master.as_deref())?;
+        config.api_key = crypto::encrypt_str(&key, &config.api_key)?;
+    }
     settings_set(&conn, "ai", &serde_json::to_string(&config)?)
 }
 
@@ -108,6 +156,8 @@ fn emit(on_event: &IpcChannel, v: &Value) {
 pub async fn ai_chat(
     state: tauri::State<'_, Arc<AiState>>,
     db: tauri::State<'_, Db>,
+    security: tauri::State<'_, SecurityState>,
+    master: Option<String>,
     messages: Vec<ChatMessage>,
     // 非 API 后端：本次要发送的最新一条用户消息（历史由后端会话持有）
     prompt: Option<String>,
@@ -117,9 +167,15 @@ pub async fn ai_chat(
 ) -> Result<u64, AppError> {
     let config: AiConfig = {
         let conn = db.0.lock().unwrap();
-        settings_get(&conn, "ai")
+        let mut cfg: AiConfig = settings_get(&conn, "ai")
             .and_then(|v| serde_json::from_str(&v).ok())
-            .ok_or_else(|| AppError::other("尚未配置 AI（baseURL/apiKey/model）"))?
+            .ok_or_else(|| AppError::other("尚未配置 AI（baseURL/apiKey/model）"))?;
+        if cfg.backend == "api" {
+            if let Some(key) = resolve_api_key(&security, &conn, master.as_deref())? {
+                cfg.api_key = key;
+            }
+        }
+        cfg
     };
 
     let chat_id = state.next_id.fetch_add(1, Ordering::SeqCst);
@@ -353,29 +409,9 @@ async fn run_api(
 
 /* ================= ZCode / dsh 子进程后端 ================= */
 
-fn default_zcode_cwd() -> std::path::PathBuf {
-    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..")
-}
-
-/// 探测 zcode.cjs（常见安装位置，找不到返回 None）
-fn autodetect_zcode_path() -> Option<String> {
-    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
-    if let Ok(la) = std::env::var("LOCALAPPDATA") {
-        candidates.push(std::path::PathBuf::from(la).join("Programs/ZCode/resources/glm/zcode.cjs"));
-    }
-    for drive in ["C:", "D:", "E:"] {
-        candidates.push(std::path::PathBuf::from(format!("{drive}/ZCode/resources/glm/zcode.cjs")));
-        candidates.push(std::path::PathBuf::from(format!("{drive}/Program Files/ZCode/resources/glm/zcode.cjs")));
-    }
-    candidates.into_iter().find(|p| p.exists()).map(|p| p.to_string_lossy().into_owned())
-}
-
-/// 探测 dsh.cmd
-fn autodetect_dsh_path() -> Option<String> {
-    let la = std::env::var("LOCALAPPDATA").ok()?;
-    let p = std::path::PathBuf::from(la)
-        .join("Programs/DeepSeek Harness/resources/runtime/cli/bin/dsh.cmd");
-    p.exists().then(|| p.to_string_lossy().into_owned())
+/// 未配置会话工作目录时的默认值：运行时数据目录（exe 旁 data\，随安装走，无编译期路径嵌入）
+fn default_backend_cwd() -> std::path::PathBuf {
+    crate::db::data_dir()
 }
 
 /// zcode 后端：node zcode.cjs -p <prompt> --json（保留 ZCode 原生工具能力）
@@ -393,27 +429,22 @@ async fn run_zcode(
         state.unregister(chat_id);
         return;
     };
-    let zcode_path = if config.zcode_path.trim().is_empty() {
-        autodetect_zcode_path()
-    } else {
-        Some(config.zcode_path.trim().to_string())
-    };
-    let Some(zcode_path) = zcode_path else {
+    if config.zcode_path.trim().is_empty() {
         emit(
             &on_event,
-            &json!({"t": "error", "v": "未找到 zcode.cjs，请在 设置 → 智能核心 中指定路径"}),
+            &json!({"t": "error", "v": "未配置 zcode.cjs 路径（设置 → AI 模型）"}),
         );
         state.unregister(chat_id);
         return;
-    };
+    }
     let cwd = if config.zcode_cwd.trim().is_empty() {
-        default_zcode_cwd()
+        default_backend_cwd()
     } else {
         std::path::PathBuf::from(&config.zcode_cwd)
     };
 
     let mut cmd = Command::new("node");
-    cmd.arg(&zcode_path)
+    cmd.arg(&config.zcode_path)
         .arg("-p")
         .arg(&prompt)
         .arg("--json")
@@ -507,7 +538,9 @@ async fn run_zcode(
     }
 }
 
-/// dsh 后端：dsh.cmd headless --json（NDJSON 事件流，真流式）
+/// dsh 后端：dsh.cmd headless --json（NDJSON 事件流）。
+/// 注意：headless 的 thinking/text 按「步」整段发出（无 token 级增量），status 阶段事件
+/// 用作前端活性提示；dsh 进程任何形式的提前退出都必须给前端终止事件，否则转圈永不停止。
 async fn run_dsh(
     state: Arc<AiState>,
     chat_id: u64,
@@ -522,52 +555,107 @@ async fn run_dsh(
         state.unregister(chat_id);
         return;
     };
-    let dsh_path = if config.dsh_path.trim().is_empty() {
-        autodetect_dsh_path()
-    } else {
-        Some(config.dsh_path.trim().to_string())
-    };
-    let Some(dsh_path) = dsh_path else {
+    if config.dsh_path.trim().is_empty() {
         emit(
             &on_event,
-            &json!({"t": "error", "v": "未找到 dsh.cmd，请在 设置 → 智能核心 中指定路径"}),
+            &json!({"t": "error", "v": "未配置 dsh.cmd 路径（设置 → AI 模型）"}),
         );
         state.unregister(chat_id);
         return;
-    };
+    }
 
-    let mut cmd = Command::new(&dsh_path);
+    let mut sid = backend_session.filter(|s| !s.trim().is_empty());
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        let (finished, aborted, stale) = run_dsh_attempt(
+            &state, chat_id, &config, &prompt, sid.clone(), &on_event, &cancel,
+        )
+        .await;
+        if aborted || (finished && !stale) {
+            return;
+        }
+        if stale && sid.is_some() && attempt < 3 {
+            // 存储的会话 id 已失效（如 Harness 清理会话）：自动换新会话重试
+            emit(
+                &on_event,
+                &json!({"t": "stage", "v": "原会话已失效，已自动新建会话"}),
+            );
+            emit(&on_event, &json!({"t": "session", "v": ""}));
+            sid = None;
+            continue;
+        }
+        return;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_dsh_attempt(
+    state: &Arc<AiState>,
+    chat_id: u64,
+    config: &AiConfig,
+    prompt: &str,
+    sid: Option<String>,
+    on_event: &IpcChannel,
+    cancel: &Arc<AtomicBool>,
+) -> (bool, bool, bool) {
+    let cwd = if config.dsh_cwd.trim().is_empty() {
+        default_backend_cwd()
+    } else {
+        std::path::PathBuf::from(&config.dsh_cwd)
+    };
+    let mut cmd = Command::new(&config.dsh_path);
     cmd.arg("headless").arg("--json");
-    if let Some(sid) = backend_session.filter(|s| !s.trim().is_empty()) {
-        cmd.arg("--session-id").arg(sid);
+    if let Some(s) = &sid {
+        cmd.arg("--session-id").arg(s);
     }
     cmd.arg("-")
+        .current_dir(&cwd)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null());
+        .stderr(std::process::Stdio::piped());
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
-            emit(&on_event, &json!({"t": "error", "v": format!("启动 dsh 失败：{e}")}));
-            state.unregister(chat_id);
-            return;
+            emit(on_event, &json!({"t": "error", "v": format!("启动 dsh 失败：{e}")}));
+            return (false, false, false);
         }
     };
     let mut stdin = child.stdin.take().expect("stdin piped");
     let mut stdout = child.stdout.take().expect("stdout piped");
+    let mut stderr = child.stderr.take().expect("stderr piped");
     let child = state.register_child(chat_id, child);
+
+    // 后台收集 stderr，提前退出时用于诊断
+    let err_task = tokio::spawn(async move {
+        let mut out: Vec<u8> = Vec::new();
+        let mut b = [0u8; 1024];
+        loop {
+            match stderr.read(&mut b).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    out.extend_from_slice(&b[..n]);
+                    if out.len() > 8192 {
+                        out.drain(..out.len() - 4096); // 只保留尾部
+                    }
+                }
+            }
+        }
+        String::from_utf8_lossy(&out).into_owned()
+    });
+
     if stdin.write_all(prompt.as_bytes()).await.is_err() {
-        emit(&on_event, &json!({"t": "error", "v": "写入 stdin 失败"}));
+        emit(on_event, &json!({"t": "error", "v": "写入 stdin 失败"}));
         let _ = child.lock().await.kill().await;
-        state.unregister(chat_id);
-        return;
+        return (false, false, false);
     }
     drop(stdin);
 
     let mut buf = vec![0u8; 65536];
     let mut linebuf: Vec<u8> = Vec::new();
     let mut finished = false;
+    let mut stale = false;
     loop {
         if cancel.load(Ordering::SeqCst) {
             break;
@@ -575,14 +663,11 @@ async fn run_dsh(
         // ChildStdout 只有 AsyncRead，无 lines()：手动按行缓冲
         let n = match tokio::time::timeout(Duration::from_secs(180), stdout.read(&mut buf)).await {
             Err(_) => {
-                emit(
-                    &on_event,
-                    &json!({"t": "error", "v": "180 秒无输出，已超时"}),
-                );
+                emit(on_event, &json!({"t": "error", "v": "180 秒无输出，已超时"}));
                 break;
             }
             Ok(Err(e)) => {
-                emit(&on_event, &json!({"t": "error", "v": format!("流中断：{e}")}));
+                emit(on_event, &json!({"t": "error", "v": format!("流中断：{e}")}));
                 break;
             }
             Ok(Ok(0)) => break,
@@ -592,7 +677,7 @@ async fn run_dsh(
         while let Some(pos) = linebuf.iter().position(|&b| b == b'\n') {
             let line: Vec<u8> = linebuf.drain(..=pos).collect();
             let line = String::from_utf8_lossy(&line[..line.len() - 1]);
-            process_dsh_line(line.trim(), &on_event, &mut finished);
+            process_dsh_line(line.trim(), on_event, &mut finished, &mut stale);
             if finished {
                 break;
             }
@@ -603,17 +688,38 @@ async fn run_dsh(
     }
     let _ = child.lock().await.kill().await;
     let aborted = cancel.load(Ordering::SeqCst);
+    let err_out = err_task.await.unwrap_or_default();
     state.unregister(chat_id);
 
     if aborted {
-        emit(&on_event, &json!({"t": "aborted"}));
-    } else if finished {
-        emit(&on_event, &json!({"t": "done"}));
+        emit(on_event, &json!({"t": "aborted"}));
+    } else if finished && !stale {
+        // 正常完成：前端靠 done 提取命令按钮并结束转圈
+        emit(on_event, &json!({"t": "done"}));
+    } else if !finished {
+        // dsh 提前退出且未完成（如会话失效、参数错误）：给前端终止事件 + 诊断尾部
+        let tail = err_out.trim();
+        let why = if tail.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "：{}",
+                tail.chars()
+                    .rev()
+                    .take(300)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect::<String>()
+            )
+        };
+        emit(on_event, &json!({"t": "error", "v": format!("dsh 异常退出{why}")}));
     }
+    (finished, aborted, stale)
 }
 
 /// 解析 dsh headless 的 NDJSON 事件行并转发到前端
-fn process_dsh_line(line: &str, on_event: &IpcChannel, finished: &mut bool) {
+fn process_dsh_line(line: &str, on_event: &IpcChannel, finished: &mut bool, stale: &mut bool) {
     let Ok(v) = serde_json::from_str::<Value>(line) else {
         return;
     };
@@ -621,6 +727,17 @@ fn process_dsh_line(line: &str, on_event: &IpcChannel, finished: &mut bool) {
         Some("session") => {
             if let Some(sid) = v["sessionId"].as_str() {
                 emit(&on_event, &json!({"t": "session", "v": sid}));
+            }
+        }
+        Some("status") => {
+            // 阶段事件：headless 无 token 级流式，用它给前端活性提示
+            let stage = match v["phase"].as_str() {
+                Some("turn_start") => Some("开始处理"),
+                Some("step_start") => Some("思考生成中"),
+                _ => None,
+            };
+            if let Some(s) = stage {
+                emit(&on_event, &json!({"t": "stage", "v": s}));
             }
         }
         Some("thinking") => {
@@ -635,6 +752,17 @@ fn process_dsh_line(line: &str, on_event: &IpcChannel, finished: &mut bool) {
                 if !text.is_empty() {
                     emit(&on_event, &json!({"t": "delta", "v": text}));
                 }
+            }
+        }
+        Some("error") => {
+            let msg = v["message"].as_str().unwrap_or("dsh 内部错误");
+            if msg.contains("does not exist") {
+                // 存储的会话 id 已失效：结束本次尝试，由外层自动新建会话重试
+                *stale = true;
+                *finished = true;
+            } else {
+                emit(&on_event, &json!({"t": "error", "v": msg}));
+                *finished = true;
             }
         }
         Some("final") => *finished = true,

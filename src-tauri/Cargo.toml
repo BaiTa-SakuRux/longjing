@@ -28,11 +28,18 @@ rusqlite = { version = "0.40.2", features = ["bundled"] }
 tokio = { version = "1.53.3", features = ["full"] }
 thiserror = "2.0.21"
 tauri-plugin-dialog = "2.8.2"
+tauri-plugin-clipboard-manager = "2"
 reqwest = { version = "0.13.5", features = ["json", "stream"] }
 futures-util = "0.3.34"
-keyring = "3"
 base64 = "0.22"
 ring = "0.17"
+
+# keyring v3 必须显式启用平台后端，否则退化为进程内 mock 存储（密钥重启即失忆）
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { version = "3", features = ["windows-native"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3", features = ["apple-native"] }
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration

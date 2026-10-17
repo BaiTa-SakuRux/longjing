@@ -1,10 +1,11 @@
 import { create } from "zustand";
 import { invoke } from "@tauri-apps/api/core";
 import { Channel } from "@tauri-apps/api/core";
-import type { Host, NewHost, Tab, TerminalSettings } from "./types";
+import type { Host, NewHost, Snippet, Tab, TerminalSettings } from "./types";
 import { TermSession } from "./term-session";
 import { serializeRecent } from "./terminal-registry";
 import { SYSTEM_PROMPT, type AiConfig, type ApiChatMessage } from "./ai";
+import { showMessage } from "./components/dialogs";
 
 interface FingerprintPrompt {
   host: Host;
@@ -18,8 +19,6 @@ export interface AiMsg {
   id: number;
   role: "user" | "assistant";
   content: string;
-  /** 思考型模型的推理过程（reasoning_content），仅展示 */
-  thinking?: string;
   /** assistant 完成后从 ``` 代码块提取的可执行命令 */
   commands: string[];
   /** 已被用户点击执行的命令下标 */
@@ -48,18 +47,20 @@ interface AppState {
   tabs: Tab[];
   activeTabId: number | null;
   fingerprintPrompt: FingerprintPrompt | null;
-  hostForm: { editing: Host | null } | null;
+  hostForm: { editing: Host | null; project?: string } | null;
 
   aiPanelOpen: boolean;
   settingsOpen: boolean;
-  /** 设置弹窗当前页：appearance / hosts / ai */
-  settingsPage: "appearance" | "hosts" | "ai";
+  /** 设置弹窗当前页：appearance / hosts / snippets / ai / security */
+  settingsPage: "appearance" | "hosts" | "ai" | "security" | "snippets";
   /** 左侧主机栏折叠（仅会话内，启动默认展开） */
   sidebarCollapsed: boolean;
   aiConfig: AiConfig | null;
   aiMessages: AiMsg[];
   aiContextChips: AiContextChip[];
   aiStreaming: boolean;
+  /** 当前 AI 处理阶段（dsh status 事件透出），用于转圈时的活性提示 */
+  aiStage: string | null;
   /** 后端会话 id（backend → sessionId），切换后端即新会话 */
   backendSessions: Record<string, string>;
 
@@ -70,6 +71,10 @@ interface AppState {
   /** 主密码锁定时暂存的连接请求，解锁后自动续连 */
   pendingConnect: { tabId: number; session: TermSession; host: Host } | null;
   terminalSettings: TerminalSettings;
+  /** 终端快捷指令 */
+  snippets: Snippet[];
+  /** 闲置自动锁定分钟数；0 = 关闭（仅主密码模式下生效） */
+  idleLockMinutes: number;
 
   transfers: TransferItem[];
 
@@ -84,10 +89,19 @@ interface AppState {
   createProject: (name: string) => Promise<void>;
   renameProject: (oldName: string, newName: string) => Promise<void>;
   deleteProject: (name: string) => Promise<void>;
-  openHostForm: (editing: Host | null) => void;
+  openHostForm: (editing: Host | null, project?: string) => void;
   closeHostForm: () => void;
   saveHost: (data: NewHost, id?: number) => Promise<void>;
   removeHost: (id: number) => Promise<void>;
+  duplicateHost: (id: number) => Promise<void>;
+
+  loadSnippets: () => Promise<void>;
+  saveSnippet: (name: string, command: string, id?: number) => Promise<void>;
+  deleteSnippet: (id: number) => Promise<void>;
+
+  /** 立即锁定：清除主密码内存态（密钥缓存 + 前端记录） */
+  lockNow: () => Promise<void>;
+  setIdleLockMinutes: (minutes: number) => Promise<void>;
 
   openHost: (host: Host) => void;
   retryTab: (tabId: number) => void;
@@ -99,7 +113,7 @@ interface AppState {
   acceptFingerprint: () => Promise<void>;
 
   toggleAiPanel: () => void;
-  openSettings: (page?: "appearance" | "hosts" | "ai") => void;
+  openSettings: (page?: "appearance" | "hosts" | "ai" | "security" | "snippets") => void;
   closeSettings: () => void;
   toggleSidebar: () => void;
   loadAiConfig: () => Promise<void>;
@@ -187,6 +201,9 @@ function wrapUntrusted(label: string, text: string): string {
   ].join("\n");
 }
 
+/** 默认项目显示名；数据库中主机的 project 为空串即属于默认项目 */
+export const DEFAULT_PROJECT_NAME = "默认项目";
+
 export const useStore = create<AppState>((set, get) => ({
   hosts: [],
   projects: [],
@@ -203,12 +220,15 @@ export const useStore = create<AppState>((set, get) => ({
   aiMessages: [],
   aiContextChips: [],
   aiStreaming: false,
+  aiStage: null,
   backendSessions: {},
   masterPassword: null,
   securityMasterSet: false,
   unlockDismissed: false,
   pendingConnect: null,
-  terminalSettings: { fontSize: 14, cursorBlink: true, scrollback: 5000 },
+  terminalSettings: { fontSize: 14, cursorBlink: true, scrollback: 5000, quickPaste: true },
+  snippets: [],
+  idleLockMinutes: 0,
 
   transfers: [],
 
@@ -227,6 +247,8 @@ export const useStore = create<AppState>((set, get) => ({
     try {
       const masterSet = await invoke<boolean>("security_status");
       set({ securityMasterSet: masterSet });
+      const idle = await invoke<string | null>("get_setting", { key: "idle_lock_minutes" });
+      set({ idleLockMinutes: idle ? Number(idle) || 0 : 0 });
     } catch (e) {
       console.error("读取安全状态失败", e);
     }
@@ -272,7 +294,12 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   createProject: async (name) => {
-    await invoke("create_project", { name });
+    const trimmed = name.trim();
+    if (!trimmed) throw new Error("项目名称不能为空");
+    if (trimmed === DEFAULT_PROJECT_NAME) {
+      throw new Error(`「${DEFAULT_PROJECT_NAME}」为默认项目的保留名，请换一个名称`);
+    }
+    await invoke("create_project", { name: trimmed });
     await get().loadProjects();
   },
 
@@ -286,8 +313,49 @@ export const useStore = create<AppState>((set, get) => ({
     await Promise.all([get().loadProjects(), get().loadHosts()]);
   },
 
-  openHostForm: (editing) => set({ hostForm: { editing } }),
+  openHostForm: (editing, project) => set({ hostForm: { editing, project } }),
   closeHostForm: () => set({ hostForm: null }),
+
+  duplicateHost: async (id) => {
+    await invoke("duplicate_host", { id });
+    await get().loadHosts();
+  },
+
+  loadSnippets: async () => {
+    try {
+      set({ snippets: await invoke<Snippet[]>("snippets_list") });
+    } catch (e) {
+      console.error("加载快捷指令失败", e);
+    }
+  },
+
+  saveSnippet: async (name, command, id) => {
+    if (id !== undefined) {
+      await invoke("snippet_update", { id, name, command });
+    } else {
+      await invoke("snippet_add", { name, command });
+    }
+    await get().loadSnippets();
+  },
+
+  deleteSnippet: async (id) => {
+    await invoke("snippet_delete", { id });
+    await get().loadSnippets();
+  },
+
+  lockNow: async () => {
+    try {
+      await invoke("security_lock");
+    } catch (e) {
+      console.error("锁定失败", e);
+    }
+    set({ masterPassword: null, unlockDismissed: false, pendingConnect: null });
+  },
+
+  setIdleLockMinutes: async (minutes) => {
+    await invoke("set_setting", { key: "idle_lock_minutes", value: String(minutes) });
+    set({ idleLockMinutes: minutes });
+  },
 
   saveHost: async (data, id) => {
     if (id !== undefined) {
@@ -466,24 +534,24 @@ ${userApiContent}`;
           m.id === assistantId ? { ...m, content: m.content + delta } : m,
         ),
       }));
-    const appendThink = (delta: string) =>
-      useStore.setState((s) => ({
-        aiMessages: s.aiMessages.map((m) =>
-          m.id === assistantId ? { ...m, thinking: (m.thinking ?? "") + delta } : m,
-        ),
-      }));
-
     const channel = new Channel<{ t: string; v?: string }>();
     channel.onmessage = (ev) => {
       if (ev.t === "delta" && ev.v) {
         appendDelta(ev.v);
-      } else if (ev.t === "think" && ev.v) {
-        appendThink(ev.v);
-      } else if (ev.t === "session" && ev.v) {
-        // 首轮拿到后端会话 id，后续消息 --resume 延续
-        useStore.setState((s) => ({
-          backendSessions: { ...s.backendSessions, [backend]: ev.v! },
-        }));
+      } else if (ev.t === "think") {
+        // 思考内容不展示、不存储（占篇幅且无回看价值），直接忽略
+      } else if (ev.t === "session") {
+        // 首轮拿到后端会话 id，后续消息 --resume 延续；空值 = 会话失效已重置，删除映射
+        useStore.setState((s) => {
+          if (!ev.v) {
+            const b = { ...s.backendSessions };
+            delete b[backend];
+            return { backendSessions: b };
+          }
+          return { backendSessions: { ...s.backendSessions, [backend]: ev.v! } };
+        });
+      } else if (ev.t === "stage" && ev.v) {
+        useStore.setState({ aiStage: ev.v });
       } else if (ev.t === "done") {
         finishAssistant(assistantId);
       } else if (ev.t === "aborted") {
@@ -532,7 +600,7 @@ ${userApiContent}`;
     const { activeTabId, tabs, aiMessages } = get();
     const tab = tabs.find((t) => t.id === activeTabId);
     if (!tab || !tab.session.alive) {
-      alert("没有已连接的终端会话，请先连接主机");
+      void showMessage("没有已连接的终端会话，请先连接主机");
       return;
     }
     const msg = aiMessages.find((m) => m.id === msgId);
@@ -596,6 +664,7 @@ ${userApiContent}`;
 function finishAssistant(assistantId: number) {
   useStore.setState((s) => ({
     aiStreaming: false,
+    aiStage: null,
     aiMessages: s.aiMessages.map((m) =>
       m.id === assistantId ? { ...m, commands: extractCommands(m.content) } : m,
     ),

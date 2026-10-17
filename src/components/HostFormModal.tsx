@@ -1,19 +1,22 @@
 import { useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
-import { useStore } from "../store";
+import { useStore, DEFAULT_PROJECT_NAME } from "../store";
 import type { NewHost } from "../types";
 
 export function HostFormModal() {
   const hostForm = useStore((s) => s.hostForm);
   const closeHostForm = useStore((s) => s.closeHostForm);
   const saveHost = useStore((s) => s.saveHost);
+  const projects = useStore((s) => s.projects);
+  const master = useStore((s) => s.masterPassword);
   const editing = hostForm?.editing ?? null;
 
   const [name, setName] = useState(editing?.name ?? "");
   const [host, setHost] = useState(editing?.host ?? "");
   const [port, setPort] = useState(String(editing?.port ?? 22));
   const [username, setUsername] = useState(editing?.username ?? "root");
-  const [project, setProject] = useState(editing?.project ?? "");
+  const [project, setProject] = useState(editing?.project ?? hostForm?.project ?? "");
   const [authType, setAuthType] = useState<"password" | "key">(
     editing?.auth_type ?? "password",
   );
@@ -22,6 +25,10 @@ export function HostFormModal() {
   const [keyPassphrase, setKeyPassphrase] = useState(editing?.key_passphrase ?? "");
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
+  const [testing, setTesting] = useState(false);
+  const [testResult, setTestResult] = useState<
+    { ok: boolean; latency_ms: number; message: string; fp_note?: string } | null
+  >(null);
 
   if (!hostForm) return null;
 
@@ -32,6 +39,46 @@ export function HostFormModal() {
       title: "选择私钥文件",
     });
     if (typeof file === "string") setKeyPath(file);
+  }
+
+  async function testConnection() {
+    if (!host.trim() || !username.trim()) {
+      setTestResult(null);
+      setError("测试前请先填写主机地址与用户名");
+      return;
+    }
+    const portNum = Number(port);
+    if (!Number.isInteger(portNum) || portNum < 1 || portNum > 65535) {
+      setTestResult(null);
+      setError("端口必须是 1-65535 的整数");
+      return;
+    }
+    setTesting(true);
+    setTestResult(null);
+    setError("");
+    try {
+      const r = await invoke<{
+        ok: boolean;
+        latency_ms: number;
+        message: string;
+        fp_note?: string;
+      }>("ssh_test", {
+        master: master ?? null,
+        hostId: editing?.id ?? null,
+        host: host.trim(),
+        port: portNum,
+        username: username.trim(),
+        authType,
+        password: authType === "password" && password ? password : null,
+        keyPath: authType === "key" && keyPath.trim() ? keyPath.trim() : null,
+        keyPassphrase: authType === "key" && keyPassphrase ? keyPassphrase : null,
+      });
+      setTestResult(r);
+    } catch (e) {
+      setTestResult({ ok: false, latency_ms: 0, message: String(e) });
+    } finally {
+      setTesting(false);
+    }
   }
 
   async function submit() {
@@ -113,13 +160,21 @@ export function HostFormModal() {
               placeholder="root"
             />
           </Field>
-          <Field label="项目（可选，用于分组）">
-            <input
+          <Field label="所属项目（未选择则归入默认项目）">
+            <select
               className={inputCls}
               value={project}
               onChange={(e) => setProject(e.target.value)}
-              placeholder="如：昇腾训练集群"
-            />
+            >
+              <option value="">{DEFAULT_PROJECT_NAME}</option>
+              {projects
+                .filter((p) => p !== "")
+                .map((p) => (
+                  <option key={p} value={p}>
+                    {p}
+                  </option>
+                ))}
+            </select>
           </Field>
 
           <Field label="认证方式">
@@ -150,7 +205,7 @@ export function HostFormModal() {
                 className={inputCls}
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
-                placeholder="本机明文存储（自用）"
+                placeholder={editing ? "留空表示不修改密码（已加密存储）" : "将加密存储于本机"}
               />
             </Field>
           ) : (
@@ -184,9 +239,29 @@ export function HostFormModal() {
           )}
         </div>
 
+        {testResult && (
+          <div className="mt-2 text-xs">
+            <p className={testResult.ok ? "text-emerald-400" : "text-rose-400"}>
+              {testResult.ok
+                ? `✓ ${testResult.message} · ${testResult.latency_ms}ms`
+                : `✗ ${testResult.message}`}
+            </p>
+            {testResult.fp_note && (
+              <p className="mt-1 text-amber-400">{testResult.fp_note}</p>
+            )}
+          </div>
+        )}
+
         {error && <p className="mt-2 text-xs text-rose-400">{error}</p>}
 
         <div className="mt-4 flex justify-end gap-2">
+          <button
+            onClick={() => void testConnection()}
+            disabled={testing || saving}
+            className={btnCls("secondary")}
+          >
+            {testing ? "测试中…" : "测试连接"}
+          </button>
           <button onClick={closeHostForm} className={btnCls("secondary")}>
             取消
           </button>

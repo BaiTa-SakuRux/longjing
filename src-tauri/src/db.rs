@@ -61,6 +61,12 @@ pub fn init() -> Result<Connection, AppError> {
         CREATE TABLE IF NOT EXISTS projects (
             name TEXT PRIMARY KEY,
             created_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+        );
+        CREATE TABLE IF NOT EXISTS snippets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            command TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
         );",
     )?;
     // 增量迁移：hosts.project（项目分组）
@@ -296,7 +302,7 @@ pub fn addr_of(host: &Host) -> String {
     format!("{}:{}", host.host, host.port)
 }
 
-/// 导出主机列表（含明文密码/密钥路径）到 JSON 文件，供换机迁移
+/// 导出主机列表到 JSON 文件；密码等敏感字段为本机密文（与系统密钥绑定），仅供本机导入
 #[tauri::command]
 pub fn hosts_export(db: tauri::State<'_, Db>, path: String) -> Result<usize, AppError> {
     let hosts = {
@@ -397,4 +403,129 @@ pub fn hosts_import(db: tauri::State<'_, Db>, path: String) -> Result<usize, App
         inserted += 1;
     }
     Ok(inserted)
+}
+
+/// 复制主机：整行复制（敏感字段保持库中原样，不经历解密-再加密），名称自动加「-副本」后缀去重
+#[tauri::command]
+pub fn duplicate_host(db: tauri::State<'_, Db>, id: i64) -> Result<(), AppError> {
+    let conn = db.0.lock().unwrap();
+    let src_name: String = conn
+        .query_row("SELECT name FROM hosts WHERE id = ?1", [id], |r| r.get(0))
+        .map_err(|_| AppError::other("主机不存在"))?;
+    let names: std::collections::HashSet<String> = {
+        let mut stmt = conn.prepare("SELECT name FROM hosts")?;
+        let list = stmt
+            .query_map([], |r| r.get(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        list.into_iter().collect()
+    };
+    let mut name = format!("{src_name}-副本");
+    let mut n = 2;
+    while names.contains(&name) {
+        name = format!("{src_name}-副本{n}");
+        n += 1;
+    }
+    conn.execute(
+        "INSERT INTO hosts (name, host, port, username, auth_type, password, key_path, key_passphrase, project)
+         SELECT ?1, host, port, username, auth_type, password, key_path, key_passphrase, project FROM hosts WHERE id = ?2",
+        rusqlite::params![name, id],
+    )?;
+    Ok(())
+}
+
+/// 批量添加主机：与 add_host 相同的加密逻辑，事务内一次插入，返回新增数量
+#[tauri::command]
+pub fn hosts_batch_add(
+    db: tauri::State<'_, Db>,
+    security: tauri::State<'_, SecurityState>,
+    master: Option<String>,
+    hosts: Vec<NewHost>,
+) -> Result<usize, AppError> {
+    let conn = db.0.lock().unwrap();
+    let key = security::resolve_key(&security, &conn, master.as_deref())?;
+    let enc = |v: &Option<String>| -> Result<Option<String>, AppError> {
+        match v {
+            Some(s) if !s.is_empty() => Ok(Some(crypto::encrypt_str(&key, s)?)),
+            _ => Ok(None),
+        }
+    };
+    let tx = conn.unchecked_transaction()?;
+    let mut inserted = 0;
+    for h in &hosts {
+        tx.execute(
+            "INSERT INTO hosts (name, host, port, username, auth_type, password, key_path, key_passphrase, project)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            rusqlite::params![
+                h.name,
+                h.host,
+                h.port,
+                h.username,
+                h.auth_type,
+                enc(&h.password)?,
+                h.key_path,
+                enc(&h.key_passphrase)?,
+                h.project.clone().unwrap_or_default(),
+            ],
+        )?;
+        inserted += 1;
+    }
+    tx.commit()?;
+    Ok(inserted)
+}
+
+/* ---------- 快捷指令 ---------- */
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Snippet {
+    pub id: i64,
+    pub name: String,
+    pub command: String,
+}
+
+fn get_snippet(conn: &Connection, id: i64) -> Result<Snippet, AppError> {
+    conn.query_row(
+        "SELECT id, name, command FROM snippets WHERE id = ?1",
+        [id],
+        |r| Ok(Snippet { id: r.get(0)?, name: r.get(1)?, command: r.get(2)? }),
+    )
+    .map_err(|_| AppError::other("快捷指令不存在"))
+}
+
+#[tauri::command]
+pub fn snippets_list(db: tauri::State<'_, Db>) -> Result<Vec<Snippet>, AppError> {
+    let conn = db.0.lock().unwrap();
+    let mut stmt = conn.prepare("SELECT id, name, command FROM snippets ORDER BY id")?;
+    let list = stmt
+        .query_map([], |r| {
+            Ok(Snippet { id: r.get(0)?, name: r.get(1)?, command: r.get(2)? })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(list)
+}
+
+#[tauri::command]
+pub fn snippet_add(db: tauri::State<'_, Db>, name: String, command: String) -> Result<Snippet, AppError> {
+    let conn = db.0.lock().unwrap();
+    conn.execute(
+        "INSERT INTO snippets (name, command) VALUES (?1, ?2)",
+        rusqlite::params![name, command],
+    )?;
+    get_snippet(&conn, conn.last_insert_rowid())
+}
+
+#[tauri::command]
+pub fn snippet_update(db: tauri::State<'_, Db>, id: i64, name: String, command: String) -> Result<(), AppError> {
+    let conn = db.0.lock().unwrap();
+    conn.execute(
+        "UPDATE snippets SET name = ?1, command = ?2 WHERE id = ?3",
+        rusqlite::params![name, command, id],
+    )?;
+    Ok(())
+}
+
+#[tauri::command]
+pub fn snippet_delete(db: tauri::State<'_, Db>, id: i64) -> Result<(), AppError> {
+    let conn = db.0.lock().unwrap();
+    conn.execute("DELETE FROM snippets WHERE id = ?1", [id])?;
+    Ok(())
 }

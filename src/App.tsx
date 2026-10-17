@@ -9,7 +9,47 @@ import { AiPanel } from "./components/AiPanel";
 import { FileSidebar } from "./components/FileSidebar";
 import { SettingsModal } from "./components/SettingsModal";
 import { UnlockModal } from "./components/UnlockModal";
+import { AppDialogs } from "./components/dialogs";
 import appIcon from "./assets/app-icon.png";
+
+/** 闲置自动锁定：主密码模式下已解锁时，超过设定时长无鼠标/键盘操作即自动锁定 */
+function useIdleLock() {
+  const masterPassword = useStore((s) => s.masterPassword);
+  const securityMasterSet = useStore((s) => s.securityMasterSet);
+  const idleLockMinutes = useStore((s) => s.idleLockMinutes);
+  const lockNow = useStore((s) => s.lockNow);
+
+  useEffect(() => {
+    if (!securityMasterSet || !idleLockMinutes) return;
+    let lastActive = Date.now();
+    const bump = () => {
+      lastActive = Date.now();
+    };
+    const events = ["mousemove", "mousedown", "keydown", "wheel"] as const;
+    events.forEach((e) => window.addEventListener(e, bump, { passive: true }));
+    const timer = window.setInterval(() => {
+      if (masterPassword !== null && Date.now() - lastActive >= idleLockMinutes * 60_000) {
+        void lockNow();
+      }
+    }, 15_000);
+    return () => {
+      events.forEach((e) => window.removeEventListener(e, bump));
+      window.clearInterval(timer);
+    };
+  }, [securityMasterSet, idleLockMinutes, masterPassword, lockNow]);
+
+  // 手动锁定快捷键：Ctrl+Alt+L（L=Lock，避开常见 Ctrl 单键组合，与系统 Win+L 互不干扰）
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.ctrlKey && e.altKey && !e.shiftKey && !e.metaKey && e.key.toLowerCase() === "l") {
+        e.preventDefault();
+        if (securityMasterSet && masterPassword !== null) void lockNow();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [securityMasterSet, masterPassword, lockNow]);
+}
 
 export default function App() {
   const loadHosts = useStore((s) => s.loadHosts);
@@ -23,6 +63,7 @@ export default function App() {
   const settingsOpen = useStore((s) => s.settingsOpen);
   const hostForm = useStore((s) => s.hostForm);
   const toggleFiles = useStore((s) => s.toggleFiles);
+  useIdleLock();
 
   useEffect(() => {
     void loadHosts();
@@ -96,6 +137,7 @@ export default function App() {
       <FingerprintModal />
       {settingsOpen && <SettingsModal />}
       <UnlockModal />
+      <AppDialogs />
     </div>
   );
 }

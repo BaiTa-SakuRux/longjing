@@ -25,6 +25,7 @@ function splitSegments(content: string): Segment[] {
 export function AiPanel() {
   const aiMessages = useStore((s) => s.aiMessages);
   const aiStreaming = useStore((s) => s.aiStreaming);
+  const aiStage = useStore((s) => s.aiStage);
   const aiConfig = useStore((s) => s.aiConfig);
   const backendLabel = (() => {
     const b = aiConfig?.backend || "api";
@@ -43,21 +44,53 @@ export function AiPanel() {
 
   const [input, setInput] = useState("");
   const listRef = useRef<HTMLDivElement>(null);
+  // 仅当用户本就停在底部时才跟随滚动；翻上去阅读/点中间的执行按钮时不再强制拉到底
+  const stickToBottomRef = useRef(true);
 
-  // 新消息/流式输出时滚到底
+  // 新消息/流式输出时跟随滚动
   useEffect(() => {
     const el = listRef.current;
-    if (el) el.scrollTop = el.scrollHeight;
+    if (el && stickToBottomRef.current) el.scrollTop = el.scrollHeight;
   }, [aiMessages]);
+
+  const onListScroll = () => {
+    const el = listRef.current;
+    if (!el) return;
+    stickToBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+  };
+
+  // 面板宽度可拖拽调整（左缘细条）
+  const [width, setWidth] = useState(384);
+  const startResize = (e: React.MouseEvent) => {
+    e.preventDefault();
+    const onMove = (ev: MouseEvent) => {
+      setWidth(Math.min(Math.max(window.innerWidth - ev.clientX, 320), window.innerWidth - 460));
+    };
+    const onUp = () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  };
 
   function send() {
     const text = input;
     setInput("");
+    stickToBottomRef.current = true;
     void aiSend(text);
   }
 
   return (
-    <aside className="flex w-96 shrink-0 flex-col border-l border-neutral-800 bg-neutral-950">
+    <aside
+      className="relative flex shrink-0 flex-col border-l border-neutral-800 bg-neutral-950"
+      style={{ width }}
+    >
+      <div
+        onMouseDown={startResize}
+        title="拖拽调整宽度"
+        className="absolute left-0 top-0 z-10 h-full w-1 cursor-col-resize transition-colors hover:bg-sky-600/60"
+      />
       {/* 头部 */}
       <div className="flex h-9 shrink-0 items-center justify-between border-b border-neutral-800 px-3">
         <span className="flex items-center gap-1.5 text-sm font-semibold text-sky-300/90">
@@ -125,7 +158,11 @@ export function AiPanel() {
       )}
 
       {/* 消息列表 */}
-      <div ref={listRef} className="min-h-0 flex-1 space-y-3 overflow-y-auto px-3 py-3 select-text">
+      <div
+        ref={listRef}
+        onScroll={onListScroll}
+        className="min-h-0 flex-1 space-y-5 overflow-y-auto px-3 py-3 select-text"
+      >
         {aiMessages.length === 0 && (
           <div className="pt-8 text-center text-xs leading-relaxed text-neutral-600">
             向龙鲸X描述你的目标，或先「读取终端」再提问。
@@ -136,21 +173,30 @@ export function AiPanel() {
         {aiMessages.map((m) =>
           m.role === "user" ? (
             <div key={m.id} className="flex justify-end">
-              <div className="max-w-[85%] rounded-lg rounded-br-sm bg-neutral-800 px-3 py-2 text-sm whitespace-pre-wrap text-neutral-200">
-                {m.content}
+              <div className="mr-1 flex flex-col items-end">
+                <span className="mb-1 text-[11px] text-neutral-600">你</span>
+                <div className="max-w-[85%] rounded-lg rounded-br-sm bg-neutral-800 px-3 py-2 text-sm whitespace-pre-wrap text-neutral-200">
+                  {m.content}
+                </div>
               </div>
             </div>
           ) : (
-            <div key={m.id} className="text-sm leading-relaxed text-neutral-300">
-              {m.thinking && (
-                <div className="mb-1.5 rounded-md border border-neutral-800 bg-neutral-900/60 px-2.5 py-1.5 text-xs whitespace-pre-wrap text-neutral-500">
-                  💭 {m.thinking}
-                </div>
-              )}
-              <MessageBody msg={m} />
-              {aiStreaming && m.id === aiMessages[aiMessages.length - 1]?.id && (
-                <span className="ml-0.5 inline-block h-3.5 w-2 animate-pulse bg-neutral-400 align-text-bottom" />
-              )}
+            <div key={m.id}>
+              <div className="mb-1 flex items-center gap-1.5 pl-0.5">
+                <AiSpark className="h-3.5 w-3.5 text-sky-400" />
+                <span className="text-[11px] font-medium text-sky-300/80">龙鲸X</span>
+              </div>
+              <div className="rounded-lg border border-neutral-800 bg-neutral-900/60 px-3 py-2.5 text-sm leading-relaxed text-neutral-300">
+                <MessageBody msg={m} />
+                {aiStreaming && m.id === aiMessages[aiMessages.length - 1]?.id && (
+                  <>
+                    <span className="ml-0.5 inline-block h-3.5 w-2 animate-pulse bg-neutral-400 align-text-bottom" />
+                    {aiStage && (
+                      <span className="ml-2 animate-pulse text-[11px] text-neutral-500">{aiStage}…</span>
+                    )}
+                  </>
+                )}
+              </div>
             </div>
           ),
         )}
@@ -209,17 +255,26 @@ function MessageBody({ msg }: { msg: AiMsg }) {
           <div key={i} className="my-1.5 overflow-hidden rounded-md border border-neutral-700">
             <div className="flex items-center justify-between bg-neutral-800/80 px-2.5 py-1">
               <span className="font-mono text-[10px] tracking-wide text-neutral-500">SHELL</span>
-              <button
-                onClick={() => aiExecuteCommand(msg.id, seg.cmdIndex)}
-                disabled={msg.executed.includes(seg.cmdIndex)}
-                className={`rounded px-2 py-0.5 text-[11px] ${
-                  msg.executed.includes(seg.cmdIndex)
-                    ? "bg-emerald-900/40 text-emerald-400"
-                    : "bg-sky-600 text-white hover:bg-sky-500"
-                }`}
-              >
-                {msg.executed.includes(seg.cmdIndex) ? "✓ 已写入终端" : "▶ 执行"}
-              </button>
+              <div className="flex items-center gap-1.5">
+                <button
+                  onClick={() => void navigator.clipboard.writeText(seg.value).catch(() => {})}
+                  title="复制命令"
+                  className="rounded px-2 py-0.5 text-[11px] text-neutral-400 hover:bg-neutral-700 hover:text-neutral-200"
+                >
+                  复制
+                </button>
+                <button
+                  onClick={() => aiExecuteCommand(msg.id, seg.cmdIndex)}
+                  disabled={msg.executed.includes(seg.cmdIndex)}
+                  className={`rounded px-2 py-0.5 text-[11px] ${
+                    msg.executed.includes(seg.cmdIndex)
+                      ? "bg-emerald-900/40 text-emerald-400"
+                      : "bg-sky-600 text-white hover:bg-sky-500"
+                  }`}
+                >
+                  {msg.executed.includes(seg.cmdIndex) ? "✓ 已写入终端" : "▶ 执行"}
+                </button>
+              </div>
             </div>
             <pre className="overflow-x-auto bg-neutral-900 px-2.5 py-2 font-mono text-xs text-emerald-300">
               {seg.value}

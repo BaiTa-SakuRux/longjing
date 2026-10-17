@@ -1,6 +1,7 @@
 import { useMemo, useState } from "react";
-import { useStore } from "../store";
+import { useStore, DEFAULT_PROJECT_NAME } from "../store";
 import { GearIcon } from "./icons";
+import { askConfirm, askText, showMessage } from "./dialogs";
 
 export function HostSidebar() {
   const collapsed = useStore((s) => s.sidebarCollapsed);
@@ -19,7 +20,6 @@ function CollapsedRail() {
       >
         »
       </button>
-      <span className="text-base" title="龙鲸X">🐋</span>
       <button
         onClick={() => openSettings("hosts")}
         title="设置"
@@ -47,6 +47,7 @@ function ExpandedSidebar() {
   const createProject = useStore((s) => s.createProject);
   const renameProject = useStore((s) => s.renameProject);
   const deleteProject = useStore((s) => s.deleteProject);
+  const duplicateHost = useStore((s) => s.duplicateHost);
   const tabs = useStore((s) => s.tabs);
 
   const [width, setWidth] = useState(232);
@@ -66,23 +67,23 @@ function ExpandedSidebar() {
   const [collapsedGroups, setCollapsedGroups] = useState<Record<string, boolean>>({});
   const [menu, setMenu] = useState<GroupMenu | null>(null);
 
-  // 项目并集：显式创建的项目 + 有主机的项目；「未分组」仅在存在未分组主机时显示
+  // 项目并集：显式创建的项目 + 有主机的项目；默认项目（空串键）仅在存在此类主机时显示
   const groups = useMemo(() => {
     const byProject = new Map<string, typeof hosts>();
     for (const h of hosts) {
-      const key = h.project.trim() || "未分组";
+      const key = h.project.trim();
       if (!byProject.has(key)) byProject.set(key, []);
       byProject.get(key)!.push(h);
     }
     const keys: string[] = [...projects];
     for (const k of byProject.keys()) {
-      if (k !== "未分组" && !keys.includes(k)) keys.push(k);
+      if (k !== "" && !keys.includes(k)) keys.push(k);
     }
     keys.sort((a, b) => a.localeCompare(b, "zh-CN"));
     const result: [string, typeof hosts][] = keys
       .filter((k) => byProject.has(k) || projects.includes(k))
       .map((k) => [k, byProject.get(k) ?? []]);
-    if (byProject.has("未分组")) result.push(["未分组", byProject.get("未分组")!]);
+    if (byProject.has("")) result.push(["", byProject.get("")!]);
     return result;
   }, [hosts, projects]);
 
@@ -92,12 +93,12 @@ function ExpandedSidebar() {
   };
 
   const promptCreateProject = async () => {
-    const name = prompt("新项目名称：");
+    const name = await askText({ title: "新建项目", placeholder: "项目名称" });
     if (!name || !name.trim()) return;
     try {
       await createProject(name.trim());
     } catch (e) {
-      alert(String(e));
+      void showMessage({ title: "新建项目失败", message: String(e) });
     }
   };
 
@@ -142,11 +143,11 @@ function ExpandedSidebar() {
 
       <div className="flex-1 overflow-y-auto px-2" onClick={() => setMenu(null)}>
         {hosts.length === 0 && projects.length === 0 && (
-          <p className="px-2 py-4 text-xs leading-relaxed text-neutral-500">
-            还没有主机。
-            <br />
-            在「设置 → 主机」中添加，或点顶部 ＋ 新建项目。
-          </p>
+          <div className="px-3 py-6 text-center text-[11px] leading-relaxed text-neutral-600">
+            <p className="mb-1.5 text-xs text-neutral-400">暂无主机</p>
+            <p>点顶部 ＋ 新建项目</p>
+            <p>再点项目旁 ＋ 添加主机</p>
+          </div>
         )}
 
         {groups.map(([project, list]) => {
@@ -154,18 +155,31 @@ function ExpandedSidebar() {
           const groupConnected = list.some((h) => stateOf(h.id) === "connected");
           return (
             <div key={project} className="mb-1">
-              <button
-                onClick={() => setCollapsedGroups((c) => ({ ...c, [project]: !c[project] }))}
+              <div
                 onContextMenu={(e) => openGroupMenu(e, project)}
-                className="flex w-full items-center gap-1 rounded px-1.5 py-1 text-left text-[11px] text-neutral-500 hover:bg-neutral-900 hover:text-neutral-300"
+                className="flex w-full items-center gap-1 rounded px-1.5 py-1 text-left text-[11px] text-neutral-500 hover:bg-neutral-900"
               >
-                <span className={`inline-block transition-transform ${isCollapsed ? "-rotate-90" : ""}`}>
-                  ▾
-                </span>
-                <span className="flex-1 truncate">{project}</span>
+                <button
+                  onClick={() => setCollapsedGroups((c) => ({ ...c, [project]: !c[project] }))}
+                  className="flex min-w-0 flex-1 items-center gap-1 rounded text-left hover:text-neutral-300"
+                >
+                  <span className={`inline-block transition-transform ${isCollapsed ? "-rotate-90" : ""}`}>
+                    ▾
+                  </span>
+                  <span className="min-w-0 flex-1 truncate">
+                    {project === "" ? DEFAULT_PROJECT_NAME : project}
+                  </span>
+                </button>
                 <span className="font-mono text-[10px] text-neutral-600">{list.length}</span>
                 {groupConnected && <span className="h-1.5 w-1.5 rounded-full bg-emerald-500" />}
-              </button>
+                <button
+                  title="在此项目下添加主机"
+                  onClick={() => openHostForm(null, project)}
+                  className="rounded px-0.5 text-xs leading-none text-neutral-600 hover:text-neutral-200"
+                >
+                  ＋
+                </button>
+              </div>
               {!isCollapsed && (
                 <ul className="space-y-0.5">
                   {list.map((h) => {
@@ -192,13 +206,22 @@ function ExpandedSidebar() {
                             {h.username}@{h.host}:{h.port}
                           </div>
                         </button>
-                        <button
-                          title="编辑"
-                          onClick={() => openHostForm(h)}
-                          className="absolute top-1.5 right-1.5 hidden rounded px-1 text-xs text-neutral-500 group-hover:block hover:text-neutral-200"
-                        >
-                          ✎
-                        </button>
+                        <div className="absolute top-1 right-1.5 hidden items-center gap-0.5 rounded group-hover:flex">
+                          <button
+                            title="复制主机"
+                            onClick={() => void duplicateHost(h.id)}
+                            className="rounded px-1 text-xs text-neutral-500 hover:text-neutral-200"
+                          >
+                            ⧉
+                          </button>
+                          <button
+                            title="编辑"
+                            onClick={() => openHostForm(h)}
+                            className="rounded px-1 text-xs text-neutral-500 hover:text-neutral-200"
+                          >
+                            ✎
+                          </button>
+                        </div>
                       </li>
                     );
                   })}
@@ -220,17 +243,22 @@ function ExpandedSidebar() {
             className="fixed z-50 w-40 rounded-md border border-neutral-700 bg-neutral-900 py-1 shadow-xl"
             style={{ left: menu.x, top: menu.y }}
           >
-            {menu.project === "未分组" ? (
+            {menu.project === "" ? (
               <div className="px-3 py-1.5 text-xs text-neutral-600">系统分组，不可修改</div>
             ) : (
               <>
                 <button
                   onClick={() => {
-                    const name = prompt("重命名项目为：", menu.project);
                     setMenu(null);
-                    if (name && name.trim() && name.trim() !== menu.project) {
-                      void renameProject(menu.project, name.trim()).catch((e) => alert(String(e)));
-                    }
+                    void (async () => {
+                      const name = await askText({ title: "重命名项目", initialValue: menu.project });
+                      if (!name || !name.trim() || name.trim() === menu.project) return;
+                      try {
+                        await renameProject(menu.project, name.trim());
+                      } catch (e) {
+                        void showMessage({ title: "重命名失败", message: String(e) });
+                      }
+                    })();
                   }}
                   className="block w-full px-3 py-1.5 text-left text-xs text-neutral-300 hover:bg-neutral-800"
                 >
@@ -238,11 +266,21 @@ function ExpandedSidebar() {
                 </button>
                 <button
                   onClick={() => {
-                    const ok = confirm(
-                      `删除项目「${menu.project}」？${hosts.some((h) => h.project === menu.project) ? "项目下的主机将移入「未分组」。" : ""}`,
-                    );
                     setMenu(null);
-                    if (ok) void deleteProject(menu.project).catch((e) => alert(String(e)));
+                    void (async () => {
+                      const ok = await askConfirm({
+                        title: "删除项目",
+                        message: `删除项目「${menu.project}」？${hosts.some((h) => h.project === menu.project) ? `项目下的主机将移入「${DEFAULT_PROJECT_NAME}」。` : ""}`,
+                        okText: "删除",
+                        danger: true,
+                      });
+                      if (!ok) return;
+                      try {
+                        await deleteProject(menu.project);
+                      } catch (e) {
+                        void showMessage({ title: "删除失败", message: String(e) });
+                      }
+                    })();
                   }}
                   className="block w-full px-3 py-1.5 text-left text-xs text-rose-400 hover:bg-rose-900/40"
                 >

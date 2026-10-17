@@ -4,6 +4,7 @@ import { open as fileDialog, save as saveDialog } from "@tauri-apps/plugin-dialo
 import CodeMirror from "@uiw/react-codemirror";
 import type { FsEntry, Tab } from "../types";
 import { useStore } from "../store";
+import { askConfirm, askText } from "./dialogs";
 
 /* ---------- 路径工具 ---------- */
 
@@ -140,7 +141,7 @@ export function FileSidebar({ tab, onClose }: { tab: Tab; onClose: () => void })
   /* ---------- 远端操作（显式接收条目，供工具栏与右键菜单共用） ---------- */
 
   const remoteMkdir = async () => {
-    const name = prompt("新文件夹名：");
+    const name = await askText({ title: "新建文件夹", placeholder: "文件夹名称" });
     if (!name) return;
     try {
       await invoke("sftp_mkdir", { sessionId, path: remoteJoin(remoteCwd, name) });
@@ -151,7 +152,7 @@ export function FileSidebar({ tab, onClose }: { tab: Tab; onClose: () => void })
   };
 
   const remoteRename = async (entry: FsEntry) => {
-    const name = prompt("重命名为：", entry.name);
+    const name = await askText({ title: "重命名", initialValue: entry.name });
     if (!name || name === entry.name) return;
     try {
       await invoke("sftp_rename", {
@@ -166,7 +167,13 @@ export function FileSidebar({ tab, onClose }: { tab: Tab; onClose: () => void })
   };
 
   const remoteDelete = async (entry: FsEntry) => {
-    if (!confirm(`删除远端${entry.is_dir ? "目录（需为空）" : "文件"}「${entry.name}」？`)) return;
+    const ok = await askConfirm({
+      title: entry.is_dir ? "删除目录" : "删除文件",
+      message: `删除远端${entry.is_dir ? "目录（需为空）" : "文件"}「${entry.name}」？`,
+      okText: "删除",
+      danger: true,
+    });
+    if (!ok) return;
     try {
       await invoke("sftp_remove", {
         sessionId,
@@ -258,7 +265,7 @@ export function FileSidebar({ tab, onClose }: { tab: Tab; onClose: () => void })
   /* ---------- 本地操作 ---------- */
 
   const localMkdir = async () => {
-    const name = prompt("新文件夹名：");
+    const name = await askText({ title: "新建文件夹", placeholder: "文件夹名称" });
     if (!name) return;
     try {
       await invoke("local_mkdir", { path: localJoin(localCwd, name) });
@@ -269,7 +276,7 @@ export function FileSidebar({ tab, onClose }: { tab: Tab; onClose: () => void })
   };
 
   const localRename = async (entry: FsEntry) => {
-    const name = prompt("重命名为：", entry.name);
+    const name = await askText({ title: "重命名", initialValue: entry.name });
     if (!name || name === entry.name) return;
     try {
       await invoke("local_rename", {
@@ -283,7 +290,13 @@ export function FileSidebar({ tab, onClose }: { tab: Tab; onClose: () => void })
   };
 
   const localDelete = async (entry: FsEntry) => {
-    if (!confirm(`删除本地${entry.is_dir ? "空目录" : "文件"}「${entry.name}」？`)) return;
+    const ok = await askConfirm({
+      title: entry.is_dir ? "删除目录" : "删除文件",
+      message: `删除本地${entry.is_dir ? "空目录" : "文件"}「${entry.name}」？`,
+      okText: "删除",
+      danger: true,
+    });
+    if (!ok) return;
     try {
       await invoke("local_remove", {
         path: localJoin(localCwd, entry.name),

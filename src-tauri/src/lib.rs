@@ -14,6 +14,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_clipboard_manager::init())
         .manage(db::Db(std::sync::Mutex::new(conn)))
         .manage(ssh::SshState::new())
         .manage(std::sync::Arc::new(ai::AiState::new()))
@@ -32,6 +33,13 @@ pub fn run() {
             db::accept_fingerprint,
             db::hosts_export,
             db::hosts_import,
+            db::duplicate_host,
+            db::hosts_batch_add,
+            db::snippets_list,
+            db::snippet_add,
+            db::snippet_update,
+            db::snippet_delete,
+            security::security_lock,
             db::list_projects,
             db::create_project,
             db::rename_project,
@@ -46,6 +54,7 @@ pub fn run() {
             ssh::ssh_input,
             ssh::ssh_resize,
             ssh::ssh_disconnect,
+            ssh::ssh_test,
             ai::ai_get_config,
             ai::ai_save_config,
             ai::ai_chat,

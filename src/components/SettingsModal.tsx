@@ -1,11 +1,13 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open as fileDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
-import { useStore } from "../store";
+import { useStore, DEFAULT_PROJECT_NAME } from "../store";
 import type { TerminalSettings } from "../types";
-import { AiSpark, ServerIcon, ShieldIcon, SlidersIcon } from "./icons";
+import { AiSpark, BoltIcon, ServerIcon, ShieldIcon, SlidersIcon } from "./icons";
+import { askConfirm, askText, showMessage } from "./dialogs";
+import { BatchAddModal } from "./BatchAddModal";
 
-type Page = "appearance" | "hosts" | "ai" | "security";
+type Page = "appearance" | "hosts" | "snippets" | "ai" | "security";
 
 export function SettingsModal() {
   // 由父组件条件挂载（打开时才 mount），初始页由 store 指定
@@ -14,8 +16,9 @@ export function SettingsModal() {
   const [page, setPage] = useState<Page>(settingsPage ?? "appearance");
 
   const titles: Record<Page, string> = {
-    appearance: "终端外观",
+    appearance: "终端设置",
     hosts: "节点管理",
+    snippets: "快捷指令",
     ai: "智能核心",
     security: "隐私加密",
   };
@@ -28,8 +31,9 @@ export function SettingsModal() {
           <div className="px-2 pt-1 pb-3 text-sm font-semibold text-neutral-200">设置</div>
           {(
             [
-              ["appearance", "终端外观", <SlidersIcon key="i" className="h-4 w-4" />],
+              ["appearance", "终端设置", <SlidersIcon key="i" className="h-4 w-4" />],
               ["hosts", "节点管理", <ServerIcon key="i" className="h-4 w-4" />],
+              ["snippets", "快捷指令", <BoltIcon key="i" className="h-4 w-4" />],
               ["ai", "智能核心", <AiSpark key="i" className="h-4 w-4" />],
               ["security", "隐私加密", <ShieldIcon key="i" className="h-4 w-4" />],
             ] as const
@@ -63,6 +67,7 @@ export function SettingsModal() {
           <div className="min-h-0 flex-1 overflow-y-auto p-4">
             {page === "appearance" && <AppearancePane />}
             {page === "hosts" && <HostsPane />}
+            {page === "snippets" && <SnippetsPane />}
             {page === "ai" && <AiPane />}
             {page === "security" && <SecurityPane />}
           </div>
@@ -81,6 +86,7 @@ function AppearancePane() {
   const [fontSize, setFontSize] = useState(String(existing.fontSize));
   const [cursorBlink, setCursorBlink] = useState(existing.cursorBlink);
   const [scrollback, setScrollback] = useState(String(existing.scrollback));
+  const [quickPaste, setQuickPaste] = useState(existing.quickPaste !== false);
   const [saved, setSaved] = useState(false);
   const [error, setError] = useState("");
   const [saving, setSaving] = useState(false);
@@ -96,7 +102,7 @@ function AppearancePane() {
       setError("回滚行数需为 100-100000 的整数");
       return;
     }
-    const s: TerminalSettings = { fontSize: fs, cursorBlink, scrollback: sb };
+    const s: TerminalSettings = { fontSize: fs, cursorBlink, scrollback: sb, quickPaste };
     setSaving(true);
     setError("");
     try {
@@ -147,6 +153,19 @@ function AppearancePane() {
         />
       </label>
 
+      <label className="flex items-center justify-between text-sm text-neutral-300">
+        <span>
+          快捷粘贴
+          <span className="block text-[11px] text-neutral-600">选中即复制、右键直接粘贴；关闭则恢复默认右键菜单</span>
+        </span>
+        <input
+          type="checkbox"
+          checked={quickPaste}
+          onChange={(e) => setQuickPaste(e.target.checked)}
+          className="h-4 w-4 accent-sky-600"
+        />
+      </label>
+
       <p className="text-[11px] text-neutral-500">保存后立即对所有已打开的终端生效。</p>
 
       {error && <p className="text-xs text-rose-400">{error}</p>}
@@ -176,30 +195,32 @@ function HostsPane() {
   const loadHosts = useStore((s) => s.loadHosts);
   const openHostForm = useStore((s) => s.openHostForm);
   const removeHost = useStore((s) => s.removeHost);
+  const duplicateHost = useStore((s) => s.duplicateHost);
   const createProject = useStore((s) => s.createProject);
   const renameProject = useStore((s) => s.renameProject);
   const deleteProject = useStore((s) => s.deleteProject);
 
   const [collapsedGroups, setCollapsedGroups] = useState<Record<string, boolean>>({});
   const [menu, setMenu] = useState<HostGroupMenu | null>(null);
+  const [batchOpen, setBatchOpen] = useState(false);
 
-  // 与侧栏一致的分组并集
+  // 与侧栏一致的分组并集；默认项目（空串键）排在最前
   const groups = (() => {
     const byProject = new Map<string, typeof hosts>();
     for (const h of hosts) {
-      const key = h.project.trim() || "未分组";
+      const key = h.project.trim();
       if (!byProject.has(key)) byProject.set(key, []);
       byProject.get(key)!.push(h);
     }
     const keys: string[] = [...projects];
     for (const k of byProject.keys()) {
-      if (k !== "未分组" && !keys.includes(k)) keys.push(k);
+      if (k !== "" && !keys.includes(k)) keys.push(k);
     }
     keys.sort((a, b) => a.localeCompare(b, "zh-CN"));
     const result: [string, typeof hosts][] = keys
       .filter((k) => byProject.has(k) || projects.includes(k))
       .map((k) => [k, byProject.get(k) ?? []]);
-    if (byProject.has("未分组")) result.push(["未分组", byProject.get("未分组")!]);
+    if (byProject.has("")) result.unshift(["", byProject.get("")!]);
     return result;
   })();
 
@@ -212,9 +233,9 @@ function HostsPane() {
       });
       if (typeof path !== "string") return;
       const n = await invoke<number>("hosts_export", { path });
-      alert(`已导出 ${n} 台主机`);
+      void showMessage(`已导出 ${n} 台主机`);
     } catch (e) {
-      alert(`导出失败：${e}`);
+      void showMessage({ title: "导出失败", message: String(e) });
     }
   };
 
@@ -228,19 +249,19 @@ function HostsPane() {
       if (typeof path !== "string") return;
       const n = await invoke<number>("hosts_import", { path });
       await loadHosts();
-      alert(n > 0 ? `已导入 ${n} 台主机（重复项已跳过）` : "没有新增主机（全部重复）");
+      void showMessage(n > 0 ? `已导入 ${n} 台主机（重复项已跳过）` : "没有新增主机（全部重复）");
     } catch (e) {
-      alert(`导入失败：${e}`);
+      void showMessage({ title: "导入失败", message: String(e) });
     }
   };
 
   const promptCreateProject = async () => {
-    const name = prompt("新项目名称：");
+    const name = await askText({ title: "新建项目", placeholder: "项目名称" });
     if (!name || !name.trim()) return;
     try {
       await createProject(name.trim());
     } catch (e) {
-      alert(String(e));
+      void showMessage({ title: "新建项目失败", message: String(e) });
     }
   };
 
@@ -252,6 +273,12 @@ function HostsPane() {
           className="rounded-md bg-sky-600 px-3 py-1.5 text-sm font-medium text-white shadow-sm transition-colors hover:bg-sky-500"
         >
           ＋ 添加主机
+        </button>
+        <button
+          onClick={() => setBatchOpen(true)}
+          className="rounded-md border border-neutral-700 px-3 py-1.5 text-sm text-neutral-300 transition-colors hover:border-neutral-500 hover:text-neutral-100"
+        >
+          批量添加
         </button>
         <button
           onClick={() => void promptCreateProject()}
@@ -296,7 +323,7 @@ function HostsPane() {
                   className="mb-1 flex w-full items-center gap-1.5 rounded px-1 py-1 text-left text-xs text-neutral-400 hover:bg-neutral-900 hover:text-neutral-200"
                 >
                   <span className={`inline-block transition-transform ${isCollapsed ? "-rotate-90" : ""}`}>▾</span>
-                  <span className="flex-1 font-medium">{project}</span>
+                  <span className="flex-1 font-medium">{project === "" ? DEFAULT_PROJECT_NAME : project}</span>
                   <span className="font-mono text-[10px] text-neutral-600">{list.length}</span>
                 </button>
                 {!isCollapsed && (
@@ -309,7 +336,7 @@ function HostsPane() {
                         <div className="min-w-0 flex-1">
                           <div className="flex items-center gap-2">
                             <span className="truncate text-sm text-neutral-200">{h.name}</span>
-                            {h.project.trim() && project === "未分组" && (
+                            {h.project.trim() && project === "" && (
                               <span className="rounded-full border border-neutral-700 px-1.5 text-[10px] text-neutral-500">
                                 {h.project}
                               </span>
@@ -326,8 +353,22 @@ function HostsPane() {
                           编辑
                         </button>
                         <button
+                          onClick={() => void duplicateHost(h.id)}
+                          className="rounded px-2 py-1 text-xs text-neutral-400 hover:bg-neutral-800 hover:text-neutral-200"
+                        >
+                          复制
+                        </button>
+                        <button
                           onClick={() => {
-                            if (confirm(`删除主机「${h.name}」？`)) void removeHost(h.id);
+                            void (async () => {
+                              const ok = await askConfirm({
+                                title: "删除主机",
+                                message: `确定删除「${h.name}」？`,
+                                okText: "删除",
+                                danger: true,
+                              });
+                              if (ok) void removeHost(h.id);
+                            })();
                           }}
                           className="rounded px-2 py-1 text-xs text-neutral-400 hover:bg-neutral-800 hover:text-rose-400"
                         >
@@ -348,7 +389,7 @@ function HostsPane() {
         </div>
       )}
       <p className="mt-3 text-[11px] text-neutral-600">
-        导出的 JSON 含明文密码，仅用于本机迁移，请妥善保管。右键项目可重命名或删除。
+        导出的 JSON 中密码为本机加密后的密文，仅供本机备份，其他设备无法解密。右键项目可重命名或删除。
       </p>
 
       {menu && (
@@ -358,17 +399,22 @@ function HostsPane() {
             className="fixed z-50 w-40 rounded-md border border-neutral-700 bg-neutral-900 py-1 shadow-xl"
             style={{ left: menu.x, top: menu.y }}
           >
-            {menu.project === "未分组" ? (
+            {menu.project === "" ? (
               <div className="px-3 py-1.5 text-xs text-neutral-600">系统分组，不可修改</div>
             ) : (
               <>
                 <button
                   onClick={() => {
-                    const name = prompt("重命名项目为：", menu.project);
                     setMenu(null);
-                    if (name && name.trim() && name.trim() !== menu.project) {
-                      void renameProject(menu.project, name.trim()).catch((e) => alert(String(e)));
-                    }
+                    void (async () => {
+                      const name = await askText({ title: "重命名项目", initialValue: menu.project });
+                      if (!name || !name.trim() || name.trim() === menu.project) return;
+                      try {
+                        await renameProject(menu.project, name.trim());
+                      } catch (e) {
+                        void showMessage({ title: "重命名失败", message: String(e) });
+                      }
+                    })();
                   }}
                   className="block w-full px-3 py-1.5 text-left text-xs text-neutral-300 hover:bg-neutral-800"
                 >
@@ -376,11 +422,21 @@ function HostsPane() {
                 </button>
                 <button
                   onClick={() => {
-                    const ok = confirm(
-                      `删除项目「${menu.project}」？${hosts.some((h) => h.project === menu.project) ? "项目下的主机将移入「未分组」。" : ""}`,
-                    );
                     setMenu(null);
-                    if (ok) void deleteProject(menu.project).catch((e) => alert(String(e)));
+                    void (async () => {
+                      const ok = await askConfirm({
+                        title: "删除项目",
+                        message: `删除项目「${menu.project}」？${hosts.some((h) => h.project === menu.project) ? `项目下的主机将移入「${DEFAULT_PROJECT_NAME}」。` : ""}`,
+                        okText: "删除",
+                        danger: true,
+                      });
+                      if (!ok) return;
+                      try {
+                        await deleteProject(menu.project);
+                      } catch (e) {
+                        void showMessage({ title: "删除失败", message: String(e) });
+                      }
+                    })();
                   }}
                   className="block w-full px-3 py-1.5 text-left text-xs text-rose-400 hover:bg-rose-900/40"
                 >
@@ -391,6 +447,7 @@ function HostsPane() {
           </div>
         </>
       )}
+      {batchOpen && <BatchAddModal onClose={() => setBatchOpen(false)} />}
     </div>
   );
 }
@@ -442,6 +499,7 @@ function AiPane() {
   const [zcodeCwd, setZcodeCwd] = useState(existing?.zcode_cwd ?? "");
   const [zcodeMode, setZcodeMode] = useState(existing?.zcode_mode ?? "");
   const [dshPath, setDshPath] = useState(existing?.dsh_path || DEFAULT_DSH_PATH);
+  const [dshCwd, setDshCwd] = useState(existing?.dsh_cwd ?? "");
   const [models, setModels] = useState<string[] | null>(null);
   const [modelsMsg, setModelsMsg] = useState("");
   const [fetchingModels, setFetchingModels] = useState(false);
@@ -482,6 +540,7 @@ function AiPane() {
       zcode_cwd: zcodeCwd.trim(),
       zcode_mode: zcodeMode.trim(),
       dsh_path: dshPath.trim(),
+      dsh_cwd: dshCwd.trim(),
     };
     if (backend === "api" && (!config.base_url || !config.api_key || !config.model)) {
       setError("自定义 API 需要 Base URL、API Key、模型三项");
@@ -630,13 +689,13 @@ function AiPane() {
               </button>
             </div>
           </Field>
-          <Field label="会话工作目录（可选，默认为项目目录）">
+          <Field label="会话工作目录（可选，默认为龙鲸X 数据目录）">
             <div className="flex gap-2">
               <input
                 className={`${inputCls} font-mono text-xs`}
                 value={zcodeCwd}
                 onChange={(e) => setZcodeCwd(e.target.value)}
-                placeholder="留空 = 龙鲸X 项目目录"
+                placeholder="留空 = 龙鲸X 数据目录"
               />
               <button
                 type="button"
@@ -685,8 +744,25 @@ function AiPane() {
               </button>
             </div>
           </Field>
+          <Field label="会话工作目录（可选，默认为龙鲸X 数据目录）">
+            <div className="flex gap-2">
+              <input
+                className={`${inputCls} font-mono text-xs`}
+                value={dshCwd}
+                onChange={(e) => setDshCwd(e.target.value)}
+                placeholder="留空 = 龙鲸X 数据目录"
+              />
+              <button
+                type="button"
+                onClick={() => void pickPath(setDshCwd, { title: "选择会话工作目录", directory: true })}
+                className="shrink-0 rounded-md bg-neutral-800 px-3 text-sm text-neutral-300 transition-colors hover:bg-neutral-700"
+              >
+                浏览
+              </button>
+            </div>
+          </Field>
           <p className="text-[11px] leading-relaxed text-neutral-500">
-            调用本机 DeepSeek Harness 的 headless 档位（纯问答），支持流式输出与思考过程显示。
+            调用本机 DeepSeek Harness 的 headless 档位（纯问答）。设置会话工作目录后，dsh 桌面端打开同一目录即可看到龙鲸X 的会话。
           </p>
         </>
       )}
@@ -717,10 +793,139 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
 
 /* ================= 安全 ================= */
 
+/* ================= 快捷指令 ================= */
+
+function SnippetsPane() {
+  const snippets = useStore((s) => s.snippets);
+  const loadSnippets = useStore((s) => s.loadSnippets);
+  const saveSnippet = useStore((s) => s.saveSnippet);
+  const deleteSnippet = useStore((s) => s.deleteSnippet);
+
+  const [editing, setEditing] = useState<{ id?: number; name: string; command: string } | null>(null);
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    void loadSnippets();
+  }, [loadSnippets]);
+
+  async function doSave() {
+    if (!editing) return;
+    if (!editing.name.trim() || !editing.command.trim()) {
+      setError("名称和命令不能为空");
+      return;
+    }
+    setBusy(true);
+    setError("");
+    try {
+      await saveSnippet(editing.name.trim(), editing.command.replace(/\r/g, ""), editing.id);
+      setEditing(null);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function doDelete(s: { id: number; name: string }) {
+    const ok = await askConfirm({
+      title: "删除快捷指令",
+      message: `删除「${s.name}」？`,
+      okText: "删除",
+      danger: true,
+    });
+    if (ok) void deleteSnippet(s.id);
+  }
+
+  return (
+    <div className="max-w-md space-y-3">
+      <p className="text-[11px] leading-relaxed text-neutral-500">
+        快捷指令可从终端顶部的「⚡ 指令」菜单一键发送到当前会话（自动回车执行）。
+      </p>
+      <button
+        onClick={() => setEditing({ name: "", command: "" })}
+        className="rounded-md bg-sky-600 px-3 py-1.5 text-sm font-medium text-white shadow-sm transition-colors hover:bg-sky-500"
+      >
+        ＋ 新建指令
+      </button>
+
+      {editing && (
+        <div className="space-y-2 rounded-md border border-neutral-700 bg-neutral-950 p-3">
+          <Field label="名称">
+            <input
+              className={inputCls}
+              value={editing.name}
+              onChange={(e) => setEditing({ ...editing, name: e.target.value })}
+              placeholder="如：查看磁盘占用"
+              autoFocus
+            />
+          </Field>
+          <Field label="命令">
+            <textarea
+              className={`${inputCls} h-20 resize-y font-mono text-xs`}
+              value={editing.command}
+              onChange={(e) => setEditing({ ...editing, command: e.target.value })}
+              placeholder="df -h"
+            />
+          </Field>
+          {error && <p className="text-xs text-rose-400">{error}</p>}
+          <div className="flex justify-end gap-2">
+            <button
+              onClick={() => {
+                setEditing(null);
+                setError("");
+              }}
+              className="rounded-md bg-neutral-800 px-3 py-1.5 text-sm text-neutral-300 transition-colors hover:bg-neutral-700"
+            >
+              取消
+            </button>
+            <button
+              onClick={() => void doSave()}
+              disabled={busy}
+              className="rounded-md bg-sky-600 px-3 py-1.5 text-sm text-white transition-colors hover:bg-sky-500 disabled:opacity-50"
+            >
+              {busy ? "保存中…" : "保存"}
+            </button>
+          </div>
+        </div>
+      )}
+
+      {snippets.length === 0 && !editing && (
+        <p className="py-4 text-center text-xs text-neutral-600">暂无快捷指令，点击「新建指令」创建。</p>
+      )}
+      <ul className="space-y-1.5">
+        {snippets.map((s) => (
+          <li key={s.id} className="flex items-center gap-2 rounded-md border border-neutral-800 bg-neutral-950 px-3 py-2">
+            <div className="min-w-0 flex-1">
+              <div className="truncate text-sm text-neutral-200">{s.name}</div>
+              <div className="truncate font-mono text-[11px] text-neutral-500 select-text">{s.command}</div>
+            </div>
+            <button
+              onClick={() => setEditing({ id: s.id, name: s.name, command: s.command })}
+              className="rounded px-2 py-1 text-xs text-neutral-400 hover:bg-neutral-800 hover:text-neutral-200"
+            >
+              编辑
+            </button>
+            <button
+              onClick={() => void doDelete(s)}
+              className="rounded px-2 py-1 text-xs text-neutral-400 hover:bg-neutral-800 hover:text-rose-400"
+            >
+              删除
+            </button>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
 function SecurityPane() {
   const securityMasterSet = useStore((s) => s.securityMasterSet);
   const setupMaster = useStore((s) => s.setupMaster);
   const clearMaster = useStore((s) => s.clearMaster);
+  const lockNow = useStore((s) => s.lockNow);
+  const idleLockMinutes = useStore((s) => s.idleLockMinutes);
+  const setIdleLockMinutes = useStore((s) => s.setIdleLockMinutes);
 
   const [pw, setPw] = useState("");
   const [confirm, setConfirm] = useState("");
@@ -783,9 +988,44 @@ function SecurityPane() {
         }`}
       >
         {securityMasterSet
-          ? "✓ 已启用主密码加密（AES-256-GCM + PBKDF2）"
+          ? "✓ 已启用主密码加密"
           : "未设置主密码（当前为系统级加密：密钥受 Windows 凭据管理器保护）"}
       </div>
+
+      {securityMasterSet && (
+        <div className="rounded-md border border-neutral-800 bg-neutral-950 p-3">
+          <div className="mb-2 text-xs font-medium text-neutral-300">锁定</div>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => void lockNow()}
+              title="快捷键 Ctrl+Alt+L"
+              className="rounded-md border border-neutral-700 px-3 py-1.5 text-xs text-neutral-300 transition-colors hover:border-rose-500/60 hover:text-rose-300"
+            >
+              立即锁定
+              <kbd className="ml-1.5 rounded border border-neutral-700 bg-neutral-800 px-1 py-px font-mono text-[10px] font-normal text-neutral-500">
+                Ctrl+Alt+L
+              </kbd>
+            </button>
+            <label className="ml-auto flex items-center gap-1.5 text-xs text-neutral-400">
+              闲置自动锁定
+              <select
+                value={idleLockMinutes}
+                onChange={(e) => void setIdleLockMinutes(Number(e.target.value))}
+                className="rounded-md border border-neutral-700 bg-neutral-800 px-1.5 py-1 text-xs text-neutral-200 outline-none focus:border-sky-500"
+              >
+                {[0, 5, 10, 15, 30].map((m) => (
+                  <option key={m} value={m}>
+                    {m === 0 ? "关闭" : `${m} 分钟`}
+                  </option>
+                ))}
+              </select>
+            </label>
+          </div>
+          <p className="mt-2 text-[11px] text-neutral-600">
+            快捷键 Ctrl+Alt+L；锁定后新建连接或查看敏感信息需重新输入主密码，已建立的会话不受影响。
+          </p>
+        </div>
+      )}
 
       {!securityMasterSet ? (
         <>

@@ -175,7 +175,10 @@ pub async fn ssh_connect(
     Ok(session_id)
 }
 
-async fn authenticate(handle: &mut Handle<ClientHandler>, host: &Host) -> Result<(), AppError> {
+async fn authenticate<H: client::Handler>(
+    handle: &mut Handle<H>,
+    host: &Host,
+) -> Result<(), AppError> {
     match host.auth_type.as_str() {
         "password" => {
             let password = host
@@ -299,4 +302,183 @@ pub async fn ssh_disconnect(ssh: tauri::State<'_, SshState>, session_id: u64) ->
         });
     }
     Ok(())
+}
+
+/// 连接测试结果：ok=false 时 message 为失败原因
+#[derive(Debug, serde::Serialize)]
+pub struct TestResult {
+    pub ok: bool,
+    pub latency_ms: u64,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fingerprint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fp_note: Option<String>,
+}
+
+/// 测试用 Handler：库中有指纹则严格比对；没有（新主机）则内存内接受，正式连接仍走 TOFU
+struct TestHandler {
+    known_fingerprint: Option<String>,
+    seen_fingerprint: Arc<Mutex<Option<String>>>,
+}
+
+impl client::Handler for TestHandler {
+    type Error = russh::Error;
+
+    async fn check_server_key(
+        &mut self,
+        server_public_key: &PublicKeyOrCertificate,
+    ) -> Result<bool, Self::Error> {
+        let fp = match server_public_key {
+            PublicKeyOrCertificate::PublicKey { key, .. } => {
+                key.fingerprint(HashAlg::Sha256).to_string()
+            }
+            PublicKeyOrCertificate::Certificate(cert) => cert
+                .public_key()
+                .fingerprint(HashAlg::Sha256)
+                .to_string(),
+        };
+        *self.seen_fingerprint.lock().unwrap() = Some(fp.clone());
+        Ok(match &self.known_fingerprint {
+            Some(k) => k == &fp,
+            None => true,
+        })
+    }
+}
+
+/// 用表单当前值测试 SSH 连接与认证，不建会话、不入库。
+/// 编辑已有主机时，留空的密码/密钥字段沿用已存值（可能是密文，需主密码解锁解密）。
+#[tauri::command]
+pub async fn ssh_test(
+    security: tauri::State<'_, SecurityState>,
+    db: tauri::State<'_, Db>,
+    master: Option<String>,
+    host_id: Option<i64>,
+    host: String,
+    port: u16,
+    username: String,
+    auth_type: String,
+    password: Option<String>,
+    key_path: Option<String>,
+    key_passphrase: Option<String>,
+) -> Result<TestResult, AppError> {
+    let t0 = std::time::Instant::now();
+    let empty_or_none = |v: &Option<String>| v.as_deref().map(str::is_empty).unwrap_or(true);
+
+    let mut h = Host {
+        id: host_id.unwrap_or(0),
+        name: "test".into(),
+        host,
+        port,
+        username,
+        auth_type,
+        password,
+        key_path,
+        key_passphrase,
+        project: String::new(),
+    };
+
+    // 编辑已有主机：留空的敏感字段沿用已存值；同时取该地址的已知指纹
+    let (stored_fp, key) = {
+        let conn = db.0.lock().unwrap();
+        let stored_fp = match host_id {
+            Some(id) => match db::get_host(&conn, id) {
+                Ok(stored) => {
+                    if empty_or_none(&h.password) {
+                        h.password = stored.password.clone();
+                    }
+                    if empty_or_none(&h.key_path) {
+                        h.key_path = stored.key_path.clone();
+                    }
+                    if empty_or_none(&h.key_passphrase) {
+                        h.key_passphrase = stored.key_passphrase.clone();
+                    }
+                    db::get_known_fingerprint(&conn, &db::addr_of(&stored))
+                        .ok()
+                        .flatten()
+                }
+                Err(_) => None,
+            },
+            None => None,
+        };
+        let key = security::resolve_key(&security, &conn, master.as_deref())?;
+        (stored_fp, key)
+    };
+
+    // 密文字段解密（编辑场景）
+    if let Some(p) = &mut h.password {
+        if crypto::is_encrypted(p) {
+            *p = crypto::decrypt_str(&key, p)?;
+        }
+    }
+    if let Some(k) = &mut h.key_passphrase {
+        if crypto::is_encrypted(k) {
+            *k = crypto::decrypt_str(&key, k)?;
+        }
+    }
+
+    let fail = |message: String, fp: Option<String>, t: std::time::Instant| TestResult {
+        ok: false,
+        latency_ms: t.elapsed().as_millis() as u64,
+        message,
+        fingerprint: fp,
+        fp_note: None,
+    };
+
+    let config = Arc::new(client::Config {
+        inactivity_timeout: None,
+        keepalive_interval: None,
+        ..Default::default()
+    });
+    let seen = Arc::new(Mutex::new(None));
+    let handler = TestHandler {
+        known_fingerprint: stored_fp.clone(),
+        seen_fingerprint: seen.clone(),
+    };
+    let addr = (h.host.as_str(), h.port);
+
+    let mut handle = match tokio::time::timeout(
+        Duration::from_secs(8),
+        client::connect(config, addr, handler),
+    )
+    .await
+    {
+        Ok(Ok(h)) => h,
+        Ok(Err(e)) => {
+            let fp = seen.lock().unwrap().clone();
+            let msg = classify_connect_error(e, &seen, stored_fp.is_some()).to_string();
+            let msg = if msg.contains("首次连接") {
+                format!("SSH 握手成功，但主机指纹未确认（{msg}）")
+            } else {
+                msg
+            };
+            return Ok(fail(msg, fp, t0));
+        }
+        Err(_) => {
+            return Ok(fail(
+                "连接超时（8 秒无响应），请检查主机地址、端口与网络".into(),
+                None,
+                t0,
+            ))
+        }
+    };
+
+    if let Err(e) = authenticate(&mut handle, &h).await {
+        let _ = handle.disconnect(Disconnect::ByApplication, "", "english").await;
+        return Ok(fail(e.to_string(), seen.lock().unwrap().clone(), t0));
+    }
+    let _ = handle.disconnect(Disconnect::ByApplication, "", "english").await;
+
+    let fp_note = if stored_fp.is_none() {
+        Some("首次连接：指纹未入库，保存主机后的正式连接将按 TOFU 确认".to_string())
+    } else {
+        None
+    };
+    Ok(TestResult {
+        ok: true,
+        latency_ms: t0.elapsed().as_millis() as u64,
+        message: format!("SSH 连接与认证成功（{}@{}:{}）", h.username, h.host, h.port),
+        fingerprint: seen.lock().unwrap().clone(),
+        fp_note,
+    })
 }

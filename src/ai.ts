@@ -12,6 +12,8 @@ export interface AiConfig {
   zcode_mode?: string;
   /** dsh.cmd 完整路径 */
   dsh_path?: string;
+  /** dsh 会话归属工作目录（空 = 项目目录） */
+  dsh_cwd?: string;
 }
 
 export interface ApiChatMessage {

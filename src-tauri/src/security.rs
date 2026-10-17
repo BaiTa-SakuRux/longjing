@@ -25,6 +25,11 @@ impl SecurityState {
     pub fn cache_key(&self, key: Key32) {
         *self.cached_key.lock().unwrap() = Some(key);
     }
+
+    /// 手动/闲置锁定：清除内存中的主密码派生密钥（下次敏感操作需重新解锁）
+    pub fn clear_cache(&self) {
+        *self.cached_key.lock().unwrap() = None;
+    }
 }
 
 pub fn hex_encode(bytes: &[u8]) -> String {
@@ -38,6 +43,13 @@ pub fn hex_decode(s: &str) -> Result<Vec<u8>, AppError> {
             u8::from_str_radix(&s[i..i + 2], 16).map_err(|e| AppError::other(e.to_string()))
         })
         .collect()
+}
+
+/// 手动锁定：清除内存缓存的主密码派生密钥
+#[tauri::command]
+pub fn security_lock(security: tauri::State<'_, SecurityState>) -> Result<(), AppError> {
+    security.clear_cache();
+    Ok(())
 }
 
 /// 是否处于主密码模式
@@ -75,7 +87,10 @@ fn derive_master_key(conn: &Connection, master: &str) -> Result<Key32, AppError>
     let key = crypto::derive_key(master, &salt);
     let check = settings_get(conn, "mp_check")
         .ok_or_else(|| AppError::other("主密码数据损坏（缺校验）"))?;
-    crypto::decrypt(&key, &check).map_err(|_| AppError::other("主密码错误"))?;
+    #[cfg(test)]
+    eprintln!("[D] 读取 mp_check={}", check);
+    let check_dec = crypto::decrypt(&key, &check);
+    check_dec.map_err(|e| AppError::other(format!("主密码错误（原始错误：{e}）")))?;
     Ok(key)
 }
 
@@ -240,4 +255,86 @@ fn rand_bytes<const N: usize>() -> Result<[u8; N], AppError> {
     let mut b = [0u8; N];
     rng.fill(&mut b).map_err(|_| AppError::other("生成随机数失败"))?;
     Ok(b)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crypto;
+
+    fn test_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE hosts (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, host TEXT, port INTEGER, username TEXT, auth_type TEXT, password TEXT, key_path TEXT, key_passphrase TEXT, project TEXT DEFAULT '', created_at TEXT);
+             CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO hosts (name, host, port, username, auth_type, password, project) VALUES ('h1','1.2.3.4',22,'root','password','secret123','p1')",
+            [],
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn master_password_full_flow() {
+        let security = SecurityState::new();
+        let conn = test_db();
+        let master = "test123";
+
+        // mp_setup 等效流程：先用系统密钥加密存量明文 → 再切换主密码密钥
+        let sys_key = system_key().unwrap();
+        let plain = collect_plaintext(&conn, &sys_key).unwrap();
+        assert_eq!(plain.hosts[0].1.as_deref(), Some("secret123"));
+        assert_eq!(plain.hosts[0].2.as_deref(), None);
+
+        let salt: [u8; SALT_LEN] = rand_bytes().unwrap();
+        let new_key = crypto::derive_key(master, &salt);
+        #[cfg(test)]
+        eprintln!("[dbg-setup] salt={} key[..4]={:02x?}", hex_encode(&salt), &new_key[..4]);
+        settings_set(&conn, "mp_salt", &hex_encode(&salt)).unwrap();
+
+        // 原语回环自检：同一密钥加密后立即解密
+        {
+            let ct = crypto::encrypt(&new_key, b"longjing-verify").unwrap();
+            let pt = crypto::decrypt(&new_key, &ct).unwrap();
+            assert_eq!(pt, b"longjing-verify", "AES-GCM 原语回环失败");
+        }
+        let mp_check_ct = crypto::encrypt(&new_key, b"longjing-verify").unwrap();
+        eprintln!("[E] 写入 mp_check={}", mp_check_ct);
+        eprintln!("[E] setup salt={} new_key={}", hex_encode(&salt), hex_encode(&new_key));
+        eprintln!("[E] mp_check_ct={}", mp_check_ct);
+        settings_set(&conn, "mp_salt", &hex_encode(&salt)).unwrap();
+        settings_set(&conn, "mp_check", &mp_check_ct).unwrap();
+        write_encrypted(&conn, &new_key, &plain).unwrap();
+        security.cache_key(new_key);
+
+        // mp_verify 等效：正确密码 → 解出 mp_check
+        let readback_salt = settings_get(&conn, "mp_salt").unwrap();
+        let decoded_salt = hex_decode(&readback_salt).unwrap();
+        let key_re = crypto::derive_key(master, &decoded_salt);
+        eprintln!("[S2] 库中salt={} 重派生key[..4]={:02x?}", readback_salt, &key_re[..4]);
+        assert_eq!(key_re[..4], new_key[..4], "重派生密钥与加密时不一致");
+        assert_eq!(readback_salt, hex_encode(&salt), "存储的 salt 与写入不一致");
+
+        let key2 = derive_master_key(&conn, master).unwrap();
+        let check = settings_get(&conn, "mp_check").unwrap();
+        let plain_check = crypto::decrypt(&key2, &check).unwrap();
+        assert_eq!(plain_check, b"longjing-verify");
+
+        // 错误密码 → 解密必须失败
+        let wrong = crypto::derive_key("wrong", &salt);
+        assert!(crypto::decrypt(&wrong, &check).is_err());
+
+        // 解密主机密码 → 与原文一致
+        let stored = settings_get; // 占位避免未使用告警
+        let _ = stored;
+        let pw: String = conn
+            .query_row("SELECT password FROM hosts WHERE name='h1'", [], |r| r.get(0))
+            .unwrap();
+        assert!(crypto::is_encrypted(&pw));
+        let dec = crypto::decrypt(&key2, &pw).unwrap();
+        assert_eq!(String::from_utf8(dec).unwrap(), "secret123");
+    }
 }
