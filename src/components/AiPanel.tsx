@@ -1,6 +1,64 @@
 import { useEffect, useRef, useState } from "react";
+import ReactMarkdown, { Components } from "react-markdown";
+import remarkGfm from "remark-gfm";
 import { useStore, type AiMsg } from "../store";
 import { AiSpark } from "./icons";
+
+/** AI 文本段的 Markdown 渲染（GFM 表格/标题/列表/行内代码）；``` 代码块不走这里（由 SHELL 卡片承接） */
+const mdComponents: Components = {
+  h1: (p) => <h1 className="mb-1.5 mt-3 text-base font-semibold text-neutral-100" {...p} />,
+  h2: (p) => (
+    <h2
+      className="mb-1.5 mt-3 border-b border-neutral-800 pb-1 text-sm font-semibold text-neutral-100"
+      {...p}
+    />
+  ),
+  h3: (p) => <h3 className="mb-1 mt-2.5 text-sm font-semibold text-neutral-200" {...p} />,
+  p: (p) => <p className="my-1.5 leading-relaxed" {...p} />,
+  ul: (p) => <ul className="my-1.5 list-disc space-y-1 pl-5" {...p} />,
+  ol: (p) => <ol className="my-1.5 list-decimal space-y-1 pl-5" {...p} />,
+  li: (p) => <li className="leading-relaxed" {...p} />,
+  strong: (p) => <strong className="font-semibold text-neutral-100" {...p} />,
+  code: (p) => (
+    <code
+      className="rounded bg-neutral-800 px-1 py-0.5 font-mono text-xs text-sky-300"
+      {...p}
+    />
+  ),
+  pre: (p) => (
+    <pre
+      className="my-1.5 overflow-x-auto rounded-md bg-neutral-900 p-2.5 font-mono text-xs text-emerald-300"
+      {...p}
+    />
+  ),
+  table: (p) => (
+    <div className="my-2 overflow-x-auto">
+      <table className="w-full border-collapse text-xs" {...p} />
+    </div>
+  ),
+  th: (p) => (
+    <th
+      className="border border-neutral-700 bg-neutral-800/80 px-2 py-1 text-left font-medium text-neutral-200"
+      {...p}
+    />
+  ),
+  td: (p) => <td className="border border-neutral-700 px-2 py-1 align-top text-neutral-300" {...p} />,
+  blockquote: (p) => (
+    <blockquote className="my-1.5 border-l-2 border-neutral-700 pl-3 text-neutral-400" {...p} />
+  ),
+  hr: (p) => <hr className="my-3 border-neutral-800" {...p} />,
+  a: (p) => <a target="_blank" rel="noreferrer" className="text-sky-400 underline underline-offset-2" {...p} />,
+};
+
+function Md({ children }: { children: string }) {
+  return (
+    <div className="text-sm leading-relaxed text-neutral-300">
+      <ReactMarkdown remarkPlugins={[remarkGfm]} components={mdComponents}>
+        {children}
+      </ReactMarkdown>
+    </div>
+  );
+}
 
 type Segment = { type: "text"; value: string } | { type: "code"; value: string; cmdIndex: number };
 
@@ -39,11 +97,16 @@ export function AiPanel() {
   const openSettings = useStore((s) => s.openSettings);
   const aiSend = useStore((s) => s.aiSend);
   const aiAbort = useStore((s) => s.aiAbort);
-  const aiReadTerminal = useStore((s) => s.aiReadTerminal);
+  const aiReadTerminals = useStore((s) => s.aiReadTerminals);
+  const tabs = useStore((s) => s.tabs);
+  const activeTabId = useStore((s) => s.activeTabId);
   const aiRemoveContextChip = useStore((s) => s.aiRemoveContextChip);
 
   const [input, setInput] = useState("");
   const listRef = useRef<HTMLDivElement>(null);
+  const aliveTabs = tabs.filter((t) => t.session.alive);
+  const [readOpen, setReadOpen] = useState(false);
+  const [readSel, setReadSel] = useState<number[] | null>(null);
   // 仅当用户本就停在底部时才跟随滚动；翻上去阅读/点中间的执行按钮时不再强制拉到底
   const stickToBottomRef = useRef(true);
 
@@ -103,13 +166,68 @@ export function AiPanel() {
           </span>
         </span>
         <div className="flex items-center gap-1">
+        <div className="relative">
           <button
-            title="读取当前终端最近输出作为上下文"
-            onClick={aiReadTerminal}
+            title="读取终端最近输出作为上下文（可多选主机）"
+            onClick={() => {
+              setReadOpen((v) => {
+                const nv = !v;
+                if (nv && readSel === null) {
+                  const def = aliveTabs.find((t) => t.id === activeTabId) ?? aliveTabs[0];
+                  setReadSel(def ? [def.id] : []);
+                }
+                return nv;
+              });
+            }}
             className="rounded px-1.5 py-0.5 text-xs text-neutral-400 hover:bg-neutral-800 hover:text-neutral-200"
           >
             读取终端
           </button>
+          {readOpen && (
+            <>
+              <div className="fixed inset-0 z-40" onClick={() => setReadOpen(false)} />
+              <div className="absolute right-0 top-full z-50 mt-px w-64 rounded-md border border-neutral-700 bg-neutral-900 py-2 shadow-xl">
+                <p className="px-3 pb-1.5 text-[11px] text-neutral-500">选择要读取的终端：</p>
+                {aliveTabs.length === 0 && (
+                  <p className="px-3 pb-2 text-xs text-neutral-600">没有已连接的会话</p>
+                )}
+                {aliveTabs.map((t) => (
+                  <label
+                    key={t.id}
+                    className="flex cursor-pointer items-center gap-2 px-3 py-1 text-xs text-neutral-300 hover:bg-neutral-800"
+                  >
+                    <input
+                      type="checkbox"
+                      checked={readSel?.includes(t.id) ?? false}
+                      onChange={(e) =>
+                        setReadSel((s) =>
+                          e.target.checked
+                            ? [...(s ?? []), t.id]
+                            : (s ?? []).filter((i) => i !== t.id),
+                        )
+                      }
+                      className="h-3.5 w-3.5 accent-sky-600"
+                    />
+                    <span className="truncate">{t.host.name}</span>
+                    <span className="ml-auto truncate text-[10px] text-neutral-600">{t.host.host}</span>
+                  </label>
+                ))}
+                <div className="mt-1 border-t border-neutral-800 px-3 pt-1.5">
+                  <button
+                    onClick={() => {
+                      void aiReadTerminals(readSel ?? []);
+                      setReadOpen(false);
+                    }}
+                    disabled={!readSel || readSel.length === 0}
+                    className="mb-1 w-full rounded bg-sky-600 px-2 py-1 text-xs text-white hover:bg-sky-500 disabled:opacity-40"
+                  >
+                    读取所选{readSel?.length ? `（${readSel.length} 台）` : ""}
+                  </button>
+                </div>
+              </div>
+            </>
+          )}
+        </div>
           <button
             title="AI 设置"
             onClick={() => openSettings("ai")}
@@ -242,37 +360,152 @@ export function AiPanel() {
 
 function MessageBody({ msg }: { msg: AiMsg }) {
   const aiExecuteCommand = useStore((s) => s.aiExecuteCommand);
+  const tabs = useStore((s) => s.tabs);
+  const [routes, setRoutes] = useState<Record<number, string>>({});
+  const [openIdx, setOpenIdx] = useState<number | null>(null);
+  const [popPos, setPopPos] = useState<{ top: number; left: number } | null>(null);
+  const aliveTabs = tabs.filter((t) => t.session.alive);
   const segments = splitSegments(msg.content);
+
+  const selNames = (idx: number): string[] => routes[idx]?.split(",").filter(Boolean) ?? [];
+  // 目标按钮短语：紧凑显示，避免长 IP 列表撑爆命令块头部
+  const routeBtnLabel = (idx: number): string => {
+    const names = selNames(idx);
+    if (names.length === 0) {
+      const auto = msg.commands[idx]?.hostTag;
+      return auto ? `→ ${auto}` : "自动";
+    }
+    if (names.length === aliveTabs.length && aliveTabs.length > 0) return `全部 ${names.length} 台`;
+    if (names.length === 1) return `→ ${names[0]}`;
+    return `已选 ${names.length} 台`;
+  };
+  // 执行按钮 tooltip：完整路由明细
+  const routeDetail = (idx: number): string => {
+    const names = selNames(idx);
+    const auto = msg.commands[idx]?.hostTag;
+    const eff = names.length ? names : auto ? [auto] : [];
+    if (eff.length === 0) return "当前激活标签";
+    if (eff.length === aliveTabs.length && aliveTabs.length > 0) {
+      return `全部 ${eff.length} 台已连接主机`;
+    }
+    return eff.join("、");
+  };
+  // 🎯 弹层用 fixed 定位：命令卡片容器 overflow-hidden 会裁剪 absolute 弹层——窄面板时左端
+  // （复选框/IP 前缀）被剪掉，矮命令块时底部（全选/清空）被剪掉。按按钮视口坐标浮动并钳制在窗口内。
+  const openRoutePop = (cmdIndex: number, el: HTMLButtonElement) => {
+    if (openIdx === cmdIndex) {
+      setOpenIdx(null);
+      return;
+    }
+    const r = el.getBoundingClientRect();
+    const h = 62 + Math.max(aliveTabs.length, 1) * 26 + 36; // 标题+主机行+底部按钮，估算高度
+    const left = Math.min(Math.max(r.right - 224, 8), window.innerWidth - 232);
+    const top = r.bottom + 4 + h > window.innerHeight ? Math.max(8, r.top - h - 4) : r.bottom + 4;
+    setPopPos({ top, left });
+    setOpenIdx(cmdIndex);
+  };
 
   return (
     <>
       {segments.map((seg, i) =>
         seg.type === "text" ? (
-          <span key={i} className="whitespace-pre-wrap">
-            {seg.value}
-          </span>
+          <Md key={i}>{seg.value}</Md>
         ) : (
           <div key={i} className="my-1.5 overflow-hidden rounded-md border border-neutral-700">
-            <div className="flex items-center justify-between bg-neutral-800/80 px-2.5 py-1">
+            <div className="relative flex items-center justify-between gap-1 bg-neutral-800/80 px-2.5 py-1">
               <span className="font-mono text-[10px] tracking-wide text-neutral-500">SHELL</span>
               <div className="flex items-center gap-1.5">
+                <div className="relative">
+                  <button
+                    onClick={(e) => openRoutePop(seg.cmdIndex, e.currentTarget)}
+                    title="目标主机（可多选；不选 = 自动）"
+                    className={`max-w-32 truncate rounded px-1.5 py-0.5 text-[10px] transition-colors ${
+                      selNames(seg.cmdIndex).length
+                        ? "bg-sky-900/60 text-sky-300"
+                        : "bg-neutral-700 text-neutral-300 hover:bg-neutral-600"
+                    }`}
+                  >
+                    🎯 {routeBtnLabel(seg.cmdIndex)}
+                  </button>
+                  {openIdx === seg.cmdIndex && popPos && (
+                    <>
+                      <div className="fixed inset-0 z-40" onClick={() => setOpenIdx(null)} />
+                      <div
+                        style={{ top: popPos.top, left: popPos.left }}
+                        className="fixed z-50 w-56 rounded-md border border-neutral-700 bg-neutral-900 py-2 shadow-xl"
+                      >
+                        <p className="px-3 pb-1.5 text-[11px] text-neutral-500">
+                          目标主机（可多选；不选 = 自动）
+                        </p>
+                        {aliveTabs.length === 0 && (
+                          <p className="px-3 pb-2 text-xs text-neutral-600">没有已连接的会话</p>
+                        )}
+                        {aliveTabs.map((t) => (
+                          <label
+                            key={t.id}
+                            className="flex cursor-pointer items-center gap-2 px-3 py-1 text-xs text-neutral-300 hover:bg-neutral-800"
+                          >
+                            <input
+                              type="checkbox"
+                              checked={selNames(seg.cmdIndex).includes(t.host.name)}
+                              onChange={(e) => {
+                                const cur = selNames(seg.cmdIndex);
+                                const next = e.target.checked
+                                  ? [...cur, t.host.name]
+                                  : cur.filter((n) => n !== t.host.name);
+                                setRoutes({ ...routes, [seg.cmdIndex]: next.join(",") });
+                              }}
+                              className="h-3.5 w-3.5 accent-sky-600"
+                            />
+                            <span className="truncate">{t.host.name}</span>
+                            <span className="ml-auto truncate text-[10px] text-neutral-600">
+                              {t.host.host}
+                            </span>
+                          </label>
+                        ))}
+                        <div className="mt-1 flex gap-1 border-t border-neutral-800 px-3 pt-1.5">
+                          <button
+                            onClick={() =>
+                              setRoutes({
+                                ...routes,
+                                [seg.cmdIndex]: aliveTabs.map((t) => t.host.name).join(","),
+                              })
+                            }
+                            className="flex-1 rounded bg-neutral-800 px-2 py-1 text-[11px] text-neutral-300 hover:bg-neutral-700"
+                          >
+                            全选
+                          </button>
+                          <button
+                            onClick={() => setRoutes({ ...routes, [seg.cmdIndex]: "" })}
+                            className="flex-1 rounded bg-neutral-800 px-2 py-1 text-[11px] text-neutral-300 hover:bg-neutral-700"
+                          >
+                            清空
+                          </button>
+                        </div>
+                      </div>
+                    </>
+                  )}
+                </div>
                 <button
                   onClick={() => void navigator.clipboard.writeText(seg.value).catch(() => {})}
                   title="复制命令"
-                  className="rounded px-2 py-0.5 text-[11px] text-neutral-400 hover:bg-neutral-700 hover:text-neutral-200"
+                  className="shrink-0 whitespace-nowrap rounded px-2 py-0.5 text-[11px] text-neutral-400 hover:bg-neutral-700 hover:text-neutral-200"
                 >
                   复制
                 </button>
                 <button
-                  onClick={() => aiExecuteCommand(msg.id, seg.cmdIndex)}
+                  onClick={() =>
+                    aiExecuteCommand(msg.id, seg.cmdIndex, routes[seg.cmdIndex] || undefined)
+                  }
                   disabled={msg.executed.includes(seg.cmdIndex)}
-                  className={`rounded px-2 py-0.5 text-[11px] ${
+                  title={`发送到：${routeDetail(seg.cmdIndex)}`}
+                  className={`shrink-0 whitespace-nowrap rounded px-2 py-0.5 text-[11px] ${
                     msg.executed.includes(seg.cmdIndex)
                       ? "bg-emerald-900/40 text-emerald-400"
                       : "bg-sky-600 text-white hover:bg-sky-500"
                   }`}
                 >
-                  {msg.executed.includes(seg.cmdIndex) ? "✓ 已写入终端" : "▶ 执行"}
+                  {msg.executed.includes(seg.cmdIndex) ? "✓ 已执行" : "▶ 执行"}
                 </button>
               </div>
             </div>

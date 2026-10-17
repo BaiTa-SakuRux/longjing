@@ -5,7 +5,7 @@ import type { Host, NewHost, Snippet, Tab, TerminalSettings } from "./types";
 import { TermSession } from "./term-session";
 import { serializeRecent } from "./terminal-registry";
 import { SYSTEM_PROMPT, type AiConfig, type ApiChatMessage } from "./ai";
-import { showMessage } from "./components/dialogs";
+import { showMessage, askConfirm } from "./components/dialogs";
 
 interface FingerprintPrompt {
   host: Host;
@@ -15,14 +15,22 @@ interface FingerprintPrompt {
   changed: boolean;
 }
 
+export interface CommandItem {
+  cmd: string;
+  /** 目标主机标注（host.name / host.host / @broadcast）；null = 当前激活标签 */
+  hostTag: string | null;
+}
+
 export interface AiMsg {
   id: number;
   role: "user" | "assistant";
   content: string;
-  /** assistant 完成后从 ``` 代码块提取的可执行命令 */
-  commands: string[];
+  /** assistant 完成后从 ``` 代码块提取的可执行命令（含目标主机标注） */
+  commands: CommandItem[];
   /** 已被用户点击执行的命令下标 */
   executed: number[];
+  /** 已执行命令的实际路由（cmdIndex → 主机名/全部 N 台） */
+  executedRoutes?: Record<number, string>;
 }
 
 export interface AiContextChip {
@@ -104,8 +112,11 @@ interface AppState {
   setIdleLockMinutes: (minutes: number) => Promise<void>;
 
   openHost: (host: Host) => void;
+  /** 复制会话：无视同主机去重，强制开一个连接同一主机的新标签 */
+  duplicateSession: (tabId: number) => void;
   retryTab: (tabId: number) => void;
   closeTab: (tabId: number) => void;
+  closeOtherTabs: (tabId: number) => void;
   setActive: (tabId: number) => void;
   toggleFiles: (tabId: number) => void;
 
@@ -124,8 +135,8 @@ interface AppState {
 
   aiSend: (text: string) => Promise<void>;
   aiAbort: () => Promise<void>;
-  aiReadTerminal: () => void;
-  aiExecuteCommand: (msgId: number, cmdIndex: number) => void;
+  aiReadTerminals: (tabIds: number[]) => void;
+  aiExecuteCommand: (msgId: number, cmdIndex: number, route?: string) => void;
   aiRemoveContextChip: (id: number) => void;
 
   startTransfer: (id: number, label: string, direction: "up" | "down") => void;
@@ -180,12 +191,22 @@ async function startSession(
   if (tab?.state === "connecting") patchTab(tabId, { state: "connected" });
 }
 
-function extractCommands(content: string): string[] {
-  const result: string[] = [];
+function extractCommands(content: string): CommandItem[] {
+  const result: CommandItem[] = [];
   const re = /```[a-zA-Z0-9_-]*\r?\n([\s\S]*?)```/g;
   for (const m of content.matchAll(re)) {
-    const body = m[1].trim();
-    if (body) result.push(body);
+    const lines = m[1].replace(/\n$/, "").split("\n");
+    let hostTag: string | null = null;
+    // 首行「# → 主机名」= AI 标注的目标主机（剥离注释行，不发给 shell）
+    if (lines.length > 1) {
+      const hit = lines[0].match(/^#\s*→\s*(\S+)\s*$/);
+      if (hit) {
+        hostTag = hit[1];
+        lines.shift();
+      }
+    }
+    const cmd = lines.join("\n").trim();
+    if (cmd) result.push({ cmd, hostTag });
   }
   return result;
 }
@@ -405,6 +426,33 @@ export const useStore = create<AppState>((set, get) => ({
     void startSession(tabId, tab.session, tab.host, get().masterPassword);
   },
 
+  duplicateSession: (tabId) => {
+    const src = get().tabs.find((t) => t.id === tabId);
+    if (!src) return;
+    const newId = nextTabId++;
+    const session = new TermSession();
+    const tab: Tab = {
+      id: newId,
+      host: src.host,
+      title: src.host.name,
+      state: "connecting",
+      session,
+      filesOpen: false,
+    };
+    set((s) => ({ tabs: [...s.tabs, tab], activeTabId: newId }));
+    void startSession(newId, session, src.host, get().masterPassword);
+  },
+
+  closeOtherTabs: (tabId) => {
+    get()
+      .tabs.filter((t) => t.id !== tabId)
+      .forEach((t) => t.session.dispose());
+    set((s) => ({
+      tabs: s.tabs.filter((t) => t.id === tabId),
+      activeTabId: tabId,
+    }));
+  },
+
   closeTab: (tabId) => {
     const tab = get().tabs.find((t) => t.id === tabId);
     tab?.session.dispose();
@@ -493,19 +541,30 @@ export const useStore = create<AppState>((set, get) => ({
     const backendSession =
       backend === "api" ? null : (get().backendSessions[backend] ?? null);
 
+    // 主机清单 + 命令路由约定（三个后端共用）
+    const aliveTabs = get().tabs.filter((t) => t.session.alive);
+    const activeTab = aliveTabs.find((t) => t.id === get().activeTabId) ?? null;
+    const hostList =
+      aliveTabs.map((t) => `${t.host.name}(${t.host.username}@${t.host.host})`).join("、") || "无";
+    const routingRules =
+      '【命令路由】若某条命令明确针对某台已连接主机，在该代码块第一行写注释「# → 主机名」（如 "# → node1"），执行按钮会把命令发往该主机；通用命令不要标注。不同主机的命令放在不同代码块分别给出。';
+
     // 非 API 后端运行在本机（Windows），注入环境说明防止它把"机器"理解成本机
-    let promptForBackend = backend === "api" ? null : userApiContent;
+    let promptForBackend: string | null = backend === "api" ? null : userApiContent;
     if (promptForBackend !== null) {
-      const active = get().tabs.find((t) => t.id === get().activeTabId);
-      const conn = active
-        ? `用户当前通过 SSH 连接着远程服务器：${active.host.username}@${active.host.host}:${active.host.port}（会话标签「${active.host.name}」）`
+      const conn = activeTab
+        ? `用户当前激活的远程服务器：${activeTab.host.username}@${activeTab.host.host}:${activeTab.host.port}（标签「${activeTab.host.name}」）`
         : "用户当前没有已连接的远程服务器";
       promptForBackend = `【环境说明】你运行在龙鲸X SSH 运维工作台中，宿主机为用户的 Windows 本机。
-${conn}。你的工具执行发生在本机，无法直接访问该远程服务器。
+【已连接主机】${hostList}；${conn}
+${routingRules}
+你的工具执行发生在本机，无法直接访问该远程服务器。
 当用户询问「机器/服务器/负载」等且上下文指向远程服务器时：请基于用户提供的终端输出作答，或给出可在远程服务器执行的命令（会渲染为一键执行按钮）；除非用户明确要求，不要检查 Windows 本机。
 分隔线以上是本次提问：
 
 ${userApiContent}`;
+    } else if (aliveTabs.length > 0) {
+      promptForBackend = `${userApiContent}\n\n【当前已连接主机】${hostList}${activeTab ? `（激活：${activeTab.host.name}）` : ""}\n${routingRules}`;
     }
 
     const userMsg: AiMsg = { id: nextAiMsgId++, role: "user", content: trimmed, commands: [], executed: [] };
@@ -524,7 +583,7 @@ ${userApiContent}`;
     const apiMessages: ApiChatMessage[] = [
       { role: "system", content: SYSTEM_PROMPT },
       ...history,
-      { role: "user", content: userApiContent },
+      { role: "user", content: promptForBackend ?? userApiContent },
     ];
 
     const assistantId = assistantMsg.id;
@@ -581,54 +640,102 @@ ${userApiContent}`;
     }
   },
 
-  aiReadTerminal: () => {
-    const { activeTabId, tabs } = get();
-    if (activeTabId === null) return;
-    const tab = tabs.find((t) => t.id === activeTabId);
-    if (!tab) return;
-    const text = serializeRecent(activeTabId);
-    if (!text) return;
+  aiReadTerminals: (tabIds) => {
+    const { tabs } = get();
+    const chips = tabIds
+      .map((id) => tabs.find((t) => t.id === id))
+      .filter((t): t is Tab => !!t && t.session.alive)
+      .map((t) => ({ tab: t, text: serializeRecent(t.id) }))
+      .filter((x): x is { tab: Tab; text: string } => !!x.text)
+      .map((x) => ({ id: nextChipId++, label: `${x.tab.host.name} 终端最近输出`, text: x.text }));
+    if (chips.length === 0) {
+      void showMessage("没有可读取的终端输出（会话未连接或暂无输出）");
+      return;
+    }
     set((s) => ({
-      aiContextChips: [
-        ...s.aiContextChips,
-        { id: nextChipId++, label: `${tab.title} 终端最近输出`, text },
-      ],
+      aiContextChips: [...s.aiContextChips, ...chips],
     }));
   },
 
-  aiExecuteCommand: (msgId, cmdIndex) => {
+  aiExecuteCommand: (msgId, cmdIndex, route) => {
     const { activeTabId, tabs, aiMessages } = get();
-    const tab = tabs.find((t) => t.id === activeTabId);
-    if (!tab || !tab.session.alive) {
-      void showMessage("没有已连接的终端会话，请先连接主机");
-      return;
-    }
     const msg = aiMessages.find((m) => m.id === msgId);
-    const cmd = msg?.commands[cmdIndex];
-    if (!cmd) return;
+    const item = msg?.commands[cmdIndex];
+    if (!item) return;
+    const enc = new TextEncoder();
+    const markDone = (routeLabel: string) =>
+      useStore.setState((s) => ({
+        aiMessages: s.aiMessages.map((m) =>
+          m.id === msgId
+            ? {
+                ...m,
+                executed: [...m.executed, cmdIndex],
+                executedRoutes: { ...(m.executedRoutes ?? {}), [cmdIndex]: routeLabel },
+              }
+            : m,
+        ),
+      }));
 
-    tab.session.write(new TextEncoder().encode(cmd + "\r"));
-    useStore.setState((s) => ({
-      aiMessages: s.aiMessages.map((m) =>
-        m.id === msgId ? { ...m, executed: [...m.executed, cmdIndex] } : m,
-      ),
-    }));
-    // 2 秒后自动截取终端输出作为上下文（用户可删除）
-    window.setTimeout(() => {
-      const out = serializeRecent(tab.id);
-      if (out) {
-        useStore.setState((s) => ({
-          aiContextChips: [
-            ...s.aiContextChips,
-            {
-              id: nextChipId++,
-              label: `执行 ${cmd.length > 40 ? cmd.slice(0, 40) + "…" : cmd} 后的输出`,
-              text: out,
-            },
-          ],
-        }));
+    // 解析目标主机集合：手动多选（逗号分隔）> AI 标注 > 当前激活标签；"@all" = 全部已连接
+    const tag = route ?? item.hostTag ?? "";
+    let targets: Tab[] = [];
+    let label = "";
+    if (tag === "@all") {
+      targets = tabs.filter((t) => t.session.alive);
+      label = `全部 ${targets.length} 台`;
+    } else if (tag) {
+      targets = tag
+        .split(",")
+        .map((n) =>
+          tabs.find(
+            (t) =>
+              t.session.alive && (t.host.name === n || t.host.host === n || t.title === n),
+          ),
+        )
+        .filter((t): t is Tab => !!t);
+      label = targets.map((t) => t.host.name).join("+") || tag;
+      if (targets.length === 0) {
+        void showMessage(`目标「${tag}」未连接或不存在`);
+        return;
       }
-    }, 2000);
+    } else {
+      const t0 = tabs.find((t) => t.id === activeTabId);
+      if (!t0 || !t0.session.alive) {
+        void showMessage("没有已连接的终端会话，请先连接主机");
+        return;
+      }
+      targets = [t0];
+      label = t0.host.name;
+    }
+
+    const write = () => {
+      targets.forEach((t) => t.session.write(enc.encode(item.cmd + "\r")));
+      markDone(label);
+      // 2 秒后把每台目标终端的执行输出都加入上下文（用户可删除）
+      window.setTimeout(() => {
+        const chips = targets
+          .filter((t) => t.session.alive)
+          .map((t) => ({ tab: t, out: serializeRecent(t.id) }))
+          .filter((x): x is { tab: Tab; out: string } => !!x.out)
+          .map((x) => ({ id: nextChipId++, label: `${x.tab.host.name} 执行后输出`, text: x.out }));
+        if (chips.length > 0) {
+          useStore.setState((s) => ({ aiContextChips: [...s.aiContextChips, ...chips] }));
+        }
+      }, 2000);
+    };
+
+    if (tag === "@all") {
+      void askConfirm({
+        title: "广播执行",
+        message: `将向 ${targets.length} 台已连接主机同时发送：\n${item.cmd}`,
+        okText: `发送到 ${targets.length} 台`,
+        danger: true,
+      }).then((ok) => {
+        if (ok) write();
+      });
+    } else {
+      write();
+    }
   },
 
   aiRemoveContextChip: (id) =>

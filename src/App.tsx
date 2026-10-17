@@ -51,6 +51,31 @@ function useIdleLock() {
   }, [securityMasterSet, masterPassword, lockNow]);
 }
 
+/** 全局接管右键菜单：屏蔽 WebView 默认菜单（刷新=重载前端，会清空全部会话并回到锁屏，属事故入口）。
+ *  输入框/文本域保留系统菜单供复制粘贴；自定义菜单（标签、主机、AI 路由等）在各自 onContextMenu 里自行弹出。 */
+function useNativeContextMenuGuard() {
+  useEffect(() => {
+    const onCtx = (e: MouseEvent) => {
+      const t = e.target as HTMLElement | null;
+      const editable =
+        !!t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable);
+      if (!editable) e.preventDefault();
+    };
+    // capture：先于 React 合成事件执行，且不受业务代码 stopPropagation 影响
+    window.addEventListener("contextmenu", onCtx, true);
+    // F5/Ctrl+R 是 WebView 的刷新快捷键，与菜单同源的事故入口一并屏蔽；
+    // 只取消浏览器默认行为，按键事件仍会派发给 xterm（终端里的 Ctrl+R 反向搜索不受影响）
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "F5" || (e.ctrlKey && e.key.toLowerCase() === "r")) e.preventDefault();
+    };
+    window.addEventListener("keydown", onKey, true);
+    return () => {
+      window.removeEventListener("contextmenu", onCtx, true);
+      window.removeEventListener("keydown", onKey, true);
+    };
+  }, []);
+}
+
 export default function App() {
   const loadHosts = useStore((s) => s.loadHosts);
   const loadAiConfig = useStore((s) => s.loadAiConfig);
@@ -64,6 +89,7 @@ export default function App() {
   const hostForm = useStore((s) => s.hostForm);
   const toggleFiles = useStore((s) => s.toggleFiles);
   useIdleLock();
+  useNativeContextMenuGuard();
 
   useEffect(() => {
     void loadHosts();

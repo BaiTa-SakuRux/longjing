@@ -604,6 +604,7 @@ async fn run_dsh_attempt(
     } else {
         std::path::PathBuf::from(&config.dsh_cwd)
     };
+    let was_new = sid.is_none();
     let mut cmd = Command::new(&config.dsh_path);
     cmd.arg("headless").arg("--json");
     if let Some(s) = &sid {
@@ -677,7 +678,14 @@ async fn run_dsh_attempt(
         while let Some(pos) = linebuf.iter().position(|&b| b == b'\n') {
             let line: Vec<u8> = linebuf.drain(..=pos).collect();
             let line = String::from_utf8_lossy(&line[..line.len() - 1]);
-            process_dsh_line(line.trim(), on_event, &mut finished, &mut stale);
+            let new_sid = process_dsh_line(line.trim(), on_event, &mut finished, &mut stale);
+            // headless 不写 Harness 桌面端的项目注册表，新会话需手动归组，否则桌面端显示「未分组」
+            if was_new {
+                if let Some(new_sid) = new_sid {
+                    let cwd2 = cwd.clone();
+                    std::thread::spawn(move || dsh_attach_session(&cwd2, &new_sid));
+                }
+            }
             if finished {
                 break;
             }
@@ -718,15 +726,145 @@ async fn run_dsh_attempt(
     (finished, aborted, stale)
 }
 
-/// 解析 dsh headless 的 NDJSON 事件行并转发到前端
-fn process_dsh_line(line: &str, on_event: &IpcChannel, finished: &mut bool, stale: &mut bool) {
-    let Ok(v) = serde_json::from_str::<Value>(line) else {
+/// 把 headless 新建的 dsh 会话登记进 Harness 桌面端的项目注册表
+/// （~/.dsh/storages/workspace.json，会话按工作区 path 匹配归属）。尽力而为：
+/// 桌面端运行中可能用内存态整文件回写盖掉本次登记——仅影响分组显示，不影响会话数据本身。
+fn dsh_attach_session(cwd: &std::path::Path, session_id: &str) {
+    let Some(path) = std::env::var("USERPROFILE")
+        .or_else(|_| std::env::var("HOME"))
+        .ok()
+        .map(|h| {
+            std::path::PathBuf::from(h)
+                .join(".dsh")
+                .join("storages")
+                .join("workspace.json")
+        })
+    else {
         return;
     };
+    let Ok(raw) = std::fs::read_to_string(&path) else { return };
+    let Ok(mut v) = serde_json::from_str::<Value>(&raw) else { return };
+    // 路径归一化：分隔符统一为 \、去尾分隔符、忽略大小写
+    let norm = |p: &str| p.replace('/', "\\").trim_end_matches('\\').to_lowercase();
+    let cwd_str = cwd.to_string_lossy();
+    let target = norm(&cwd_str);
+    let Some(workspaces) = v["tables"]["workspaces"].as_object_mut() else { return };
+    let mut matched: Option<String> = None;
+    for (k, w) in workspaces.iter() {
+        if w["path"].as_str().is_some_and(|p| norm(p) == target) {
+            matched = Some(k.clone());
+            break;
+        }
+    }
+    let now = iso_utc_now();
+    match matched {
+        Some(k) => {
+            if let Some(w) = workspaces.get_mut(&k) {
+                if let Some(ids) = w["sessionIds"].as_array_mut() {
+                    if !ids.iter().any(|x| x.as_str() == Some(session_id)) {
+                        ids.push(json!(session_id));
+                        w["updatedAt"] = json!(now);
+                    }
+                }
+            }
+        }
+        None => {
+            // 该目录从未在桌面端打开过：新建工作区条目，标题取目录名
+            let id = uuid_v4();
+            workspaces.insert(
+                id.clone(),
+                json!({
+                    "path": cwd_str,
+                    "title": cwd
+                        .file_name()
+                        .map(|s| s.to_string_lossy().to_string())
+                        .unwrap_or_else(|| cwd_str.to_string()),
+                    "sessionIds": [session_id],
+                    "createdAt": now,
+                    "updatedAt": now,
+                }),
+            );
+            if let Some(ids) = v["global"]["workspaceIds"].as_array_mut() {
+                if !ids.iter().any(|x| x.as_str() == Some(&id)) {
+                    ids.push(json!(id));
+                }
+            }
+        }
+    }
+    let tmp = path.with_extension("json.longjing-tmp");
+    if std::fs::write(&tmp, serde_json::to_string_pretty(&v).unwrap_or_default()).is_ok() {
+        for _ in 0..3 {
+            if std::fs::rename(&tmp, &path).is_ok() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(30));
+        }
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+fn uuid_v4() -> String {
+    use ring::rand::SecureRandom;
+    let mut b = [0u8; 16];
+    if ring::rand::SystemRandom::new().fill(&mut b).is_err() {
+        let n = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        b = n.to_le_bytes();
+    }
+    b[6] = (b[6] & 0x0f) | 0x40;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    let h: Vec<String> = b.iter().map(|x| format!("{x:02x}")).collect();
+    format!(
+        "{}{}{}{}-{}{}-{}{}-{}{}-{}{}{}{}{}{}",
+        h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7], h[8], h[9], h[10], h[11], h[12], h[13],
+        h[14], h[15]
+    )
+}
+
+/// UTC 当前时间，Harness workspace.json 使用的 ISO-8601 毫秒格式（2026-09-04T03:29:11.377Z）
+fn iso_utc_now() -> String {
+    let d = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = d.as_secs();
+    let (days, sod) = (secs / 86400, secs % 86400);
+    // 天数 → 公历年月日（Howard Hinnant civil_from_days 算法）
+    let z = days as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let dday = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { yoe + era * 400 + 1 } else { yoe + era * 400 };
+    format!(
+        "{y:04}-{m:02}-{dday:02}T{:02}:{:02}:{:02}.{ms:03}Z",
+        sod / 3600,
+        (sod % 3600) / 60,
+        sod % 60,
+        ms = d.subsec_millis()
+    )
+}
+
+/// 解析 dsh headless 的 NDJSON 事件行并转发到前端；返回本次携带的会话 id（若有）
+fn process_dsh_line(
+    line: &str,
+    on_event: &IpcChannel,
+    finished: &mut bool,
+    stale: &mut bool,
+) -> Option<String> {
+    let Ok(v) = serde_json::from_str::<Value>(line) else {
+        return None;
+    };
+    let mut new_sid = None;
     match v["type"].as_str() {
         Some("session") => {
             if let Some(sid) = v["sessionId"].as_str() {
                 emit(&on_event, &json!({"t": "session", "v": sid}));
+                new_sid = Some(sid.to_string());
             }
         }
         Some("status") => {
@@ -768,4 +906,5 @@ fn process_dsh_line(line: &str, on_event: &IpcChannel, finished: &mut bool, stal
         Some("final") => *finished = true,
         _ => {}
     }
+    new_sid
 }

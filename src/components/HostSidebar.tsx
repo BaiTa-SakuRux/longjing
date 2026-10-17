@@ -48,6 +48,7 @@ function ExpandedSidebar() {
   const renameProject = useStore((s) => s.renameProject);
   const deleteProject = useStore((s) => s.deleteProject);
   const duplicateHost = useStore((s) => s.duplicateHost);
+  const removeHost = useStore((s) => s.removeHost);
   const tabs = useStore((s) => s.tabs);
 
   const [width, setWidth] = useState(232);
@@ -220,6 +221,31 @@ function ExpandedSidebar() {
                             className="rounded px-1 text-xs text-neutral-500 hover:text-neutral-200"
                           >
                             ✎
+                          </button>
+                          <button
+                            title="删除主机"
+                            onClick={() => {
+                              void (async () => {
+                                const inUse = useStore
+                                  .getState()
+                                  .tabs.some((t) => t.host.id === h.id);
+                                const ok = await askConfirm({
+                                  title: "删除主机",
+                                  message: `确定删除「${h.name}」？${inUse ? "与之连接的标签页将一并关闭。" : ""}`,
+                                  okText: "删除",
+                                  danger: true,
+                                });
+                                if (!ok) return;
+                                try {
+                                  await removeHost(h.id);
+                                } catch (e) {
+                                  void showMessage({ title: "删除失败", message: String(e) });
+                                }
+                              })();
+                            }}
+                            className="rounded px-1 text-xs text-neutral-500 hover:text-rose-400"
+                          >
+                            🗑
                           </button>
                         </div>
                       </li>

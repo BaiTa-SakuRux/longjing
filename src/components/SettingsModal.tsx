@@ -762,7 +762,8 @@ function AiPane() {
             </div>
           </Field>
           <p className="text-[11px] leading-relaxed text-neutral-500">
-            调用本机 DeepSeek Harness 的 headless 档位（纯问答）。设置会话工作目录后，dsh 桌面端打开同一目录即可看到龙鲸X 的会话。
+            调用本机 DeepSeek Harness 的 headless 档位（纯问答）。设置会话工作目录后，新会话会自动归入
+            dsh 桌面端该目录的项目（改动只影响新会话，旧会话可在桌面端手动拖动归组）。
           </p>
         </>
       )}
