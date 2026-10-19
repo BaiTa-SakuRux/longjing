@@ -2,6 +2,18 @@
 
 > 自用 SSH 运维工作台 + AI 助手：多标签终端、多主机 AI 协同、SFTP 文件管理，装进一个绿色可执行文件。
 
+## 📥 下载
+
+前往 [**Releases 页面**](https://github.com/BaiTa-SakuRux/longjing/releases/latest) 获取最新版本，三种包装任选：
+
+| 附件 | 说明 |
+|---|---|
+| `LongjingX_x.y.z_x64-portable.exe` | **绿色版**，免安装，下载双击即用 |
+| `LongjingX_x.y.z_x64-setup.exe` | 安装向导（简体中文引导），装进系统并创建开始菜单 |
+| `LongjingX_x.y.z_x64_en-US.msi` | MSI 标准安装包，支持静默安装与组策略批量部署 |
+
+系统要求：Windows 10/11（x64）+ WebView2 运行时（Win11 已内置）。
+
 ## 📸 界面预览
 
 **多标签终端 + 主机工作台**：四台测试机同时在线，主机按项目分组、连接状态一目了然。
