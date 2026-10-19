@@ -2,7 +2,8 @@ import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open as fileDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { useStore, DEFAULT_PROJECT_NAME } from "../store";
-import type { TerminalSettings } from "../types";
+import { buildProjectTree, type ProjectNode } from "../projects";
+import type { Host, TerminalSettings } from "../types";
 import { AiSpark, BoltIcon, ServerIcon, ShieldIcon, SlidersIcon } from "./icons";
 import { askConfirm, askText, showMessage } from "./dialogs";
 import { BatchAddModal } from "./BatchAddModal";
@@ -183,10 +184,11 @@ function AppearancePane() {
 
 /* ================= SSH 主机 ================= */
 
+/** 右键菜单目标；node = null 表示「默认项目」（系统分组） */
 interface HostGroupMenu {
   x: number;
   y: number;
-  project: string;
+  node: ProjectNode | null;
 }
 
 function HostsPane() {
@@ -200,29 +202,20 @@ function HostsPane() {
   const renameProject = useStore((s) => s.renameProject);
   const deleteProject = useStore((s) => s.deleteProject);
 
-  const [collapsedGroups, setCollapsedGroups] = useState<Record<string, boolean>>({});
+  const [collapsedGroups, setCollapsedGroups] = useState<Record<number, boolean>>({});
   const [menu, setMenu] = useState<HostGroupMenu | null>(null);
   const [batchOpen, setBatchOpen] = useState(false);
 
-  // 与侧栏一致的分组并集；默认项目（空串键）排在最前
-  const groups = (() => {
-    const byProject = new Map<string, typeof hosts>();
-    for (const h of hosts) {
-      const key = h.project.trim();
-      if (!byProject.has(key)) byProject.set(key, []);
-      byProject.get(key)!.push(h);
-    }
-    const keys: string[] = [...projects];
-    for (const k of byProject.keys()) {
-      if (k !== "" && !keys.includes(k)) keys.push(k);
-    }
-    keys.sort((a, b) => a.localeCompare(b, "zh-CN"));
-    const result: [string, typeof hosts][] = keys
-      .filter((k) => byProject.has(k) || projects.includes(k))
-      .map((k) => [k, byProject.get(k) ?? []]);
-    if (byProject.has("")) result.unshift(["", byProject.get("")!]);
-    return result;
-  })();
+  // 项目树 + 按项目名索引主机；默认项目（空串）单独一组，排在最前（与侧栏口径一致）
+  const tree = buildProjectTree(projects);
+  const byProject = new Map<string, Host[]>();
+  for (const h of hosts) {
+    const key = h.project.trim();
+    if (!byProject.has(key)) byProject.set(key, []);
+    byProject.get(key)!.push(h);
+  }
+  const hostsOf = (node: ProjectNode) => byProject.get(node.name) ?? [];
+  const defaultHosts = byProject.get("") ?? [];
 
   const doExport = async () => {
     if (hosts.length === 0) return;
@@ -265,6 +258,128 @@ function HostsPane() {
     }
   };
 
+  /** 主机行（项目节点与默认项目组共用） */
+  const renderHostRow = (h: Host, badge?: string) => (
+    <li
+      key={h.id}
+      className="group flex items-center gap-3 rounded-md border border-neutral-800 bg-neutral-950 px-3 py-2"
+    >
+      <div className="min-w-0 flex-1">
+        <div className="flex items-center gap-2">
+          <span className="truncate text-sm text-neutral-200">{h.name}</span>
+          {badge && (
+            <span className="rounded-full border border-neutral-700 px-1.5 text-[10px] text-neutral-500">
+              {badge}
+            </span>
+          )}
+        </div>
+        <div className="truncate text-[11px] text-neutral-500">
+          {h.username}@{h.host}:{h.port} · {h.auth_type === "password" ? "密码" : "私钥"}
+        </div>
+      </div>
+      <button
+        onClick={() => openHostForm(h)}
+        className="rounded px-2 py-1 text-xs text-neutral-400 hover:bg-neutral-800 hover:text-neutral-200"
+      >
+        编辑
+      </button>
+      <button
+        onClick={() => void duplicateHost(h.id)}
+        className="rounded px-2 py-1 text-xs text-neutral-400 hover:bg-neutral-800 hover:text-neutral-200"
+      >
+        复制
+      </button>
+      <button
+        onClick={() => {
+          void (async () => {
+            const ok = await askConfirm({
+              title: "删除主机",
+              message: `确定删除「${h.name}」？`,
+              okText: "删除",
+              danger: true,
+            });
+            if (ok) void removeHost(h.id);
+          })();
+        }}
+        className="rounded px-2 py-1 text-xs text-neutral-400 hover:bg-neutral-800 hover:text-rose-400"
+      >
+        删除
+      </button>
+    </li>
+  );
+
+  /** 递归渲染一个项目节点：标题行 + 直属主机 + 子项目 */
+  const renderGroup = (node: ProjectNode) => {
+    const list = hostsOf(node);
+    const isCollapsed = collapsedGroups[node.id];
+    return (
+      <div key={node.id}>
+        <button
+          onClick={() => setCollapsedGroups((c) => ({ ...c, [node.id]: !c[node.id] }))}
+          onContextMenu={(e) => {
+            e.preventDefault();
+            setMenu({
+              x: Math.min(e.clientX, window.innerWidth - 170),
+              y: Math.min(e.clientY, window.innerHeight - 150),
+              node,
+            });
+          }}
+          style={{ paddingLeft: 4 + node.depth * 14 }}
+          className="mb-1 flex w-full items-center gap-1.5 rounded pr-1 py-1 text-left text-xs text-neutral-400 hover:bg-neutral-900 hover:text-neutral-200"
+        >
+          <span className={`inline-block transition-transform ${isCollapsed ? "-rotate-90" : ""}`}>▾</span>
+          <span className="flex-1 truncate font-medium" title={node.pathLabel}>
+            {node.name}
+          </span>
+          <span className="font-mono text-[10px] text-neutral-600">{list.length}</span>
+        </button>
+        {!isCollapsed && (
+          <>
+            <ul className="space-y-1.5" style={{ marginLeft: node.depth * 14 }}>
+              {list.map((h) => renderHostRow(h))}
+              {list.length === 0 && node.children.length === 0 && (
+                <li className="rounded-md border border-dashed border-neutral-800 px-3 py-2 text-center text-[11px] text-neutral-600">
+                  空项目
+                </li>
+              )}
+            </ul>
+            {node.children.map((child) => renderGroup(child))}
+          </>
+        )}
+      </div>
+    );
+  };
+
+  /** 默认项目组（系统分组，不属于树；仅存在此类主机时显示） */
+  const defaultGroup =
+    defaultHosts.length > 0 ? (
+      <div key={0}>
+        <button
+          onClick={() => setCollapsedGroups((c) => ({ ...c, [0]: !c[0] }))}
+          onContextMenu={(e) => {
+            e.preventDefault();
+            setMenu({
+              x: Math.min(e.clientX, window.innerWidth - 170),
+              y: Math.min(e.clientY, window.innerHeight - 150),
+              node: null,
+            });
+          }}
+          className="mb-1 flex w-full items-center gap-1.5 rounded px-1 py-1 text-left text-xs text-neutral-400 hover:bg-neutral-900 hover:text-neutral-200"
+        >
+          <span className={`inline-block transition-transform ${collapsedGroups[0] ? "-rotate-90" : ""}`}>▾</span>
+          <span className="flex-1 font-medium">{DEFAULT_PROJECT_NAME}</span>
+          <span className="font-mono text-[10px] text-neutral-600">{defaultHosts.length}</span>
+        </button>
+        {!collapsedGroups[0] && (
+          <ul className="space-y-1.5">
+            {defaultHosts.map((h) =>
+              renderHostRow(h, h.project.trim() || undefined),
+            )}
+          </ul>
+        )}
+      </div>
+    ) : null;
+
   return (
     <div>
       <div className="mb-4 flex items-center gap-2">
@@ -302,92 +417,17 @@ function HostsPane() {
         </button>
       </div>
 
-      {groups.length === 0 ? (
+      {tree.length === 0 && defaultHosts.length === 0 ? (
         <p className="py-6 text-center text-xs text-neutral-600">还没有主机，点击「添加主机」创建。</p>
       ) : (
         <div className="space-y-3">
-          {groups.map(([project, list]) => {
-            const isCollapsed = collapsedGroups[project];
-            return (
-              <div key={project}>
-                <button
-                  onClick={() => setCollapsedGroups((c) => ({ ...c, [project]: !c[project] }))}
-                  onContextMenu={(e) => {
-                    e.preventDefault();
-                    setMenu({
-                      x: Math.min(e.clientX, window.innerWidth - 170),
-                      y: Math.min(e.clientY, window.innerHeight - 120),
-                      project,
-                    });
-                  }}
-                  className="mb-1 flex w-full items-center gap-1.5 rounded px-1 py-1 text-left text-xs text-neutral-400 hover:bg-neutral-900 hover:text-neutral-200"
-                >
-                  <span className={`inline-block transition-transform ${isCollapsed ? "-rotate-90" : ""}`}>▾</span>
-                  <span className="flex-1 font-medium">{project === "" ? DEFAULT_PROJECT_NAME : project}</span>
-                  <span className="font-mono text-[10px] text-neutral-600">{list.length}</span>
-                </button>
-                {!isCollapsed && (
-                  <ul className="space-y-1.5">
-                    {list.map((h) => (
-                      <li
-                        key={h.id}
-                        className="group flex items-center gap-3 rounded-md border border-neutral-800 bg-neutral-950 px-3 py-2"
-                      >
-                        <div className="min-w-0 flex-1">
-                          <div className="flex items-center gap-2">
-                            <span className="truncate text-sm text-neutral-200">{h.name}</span>
-                            {h.project.trim() && project === "" && (
-                              <span className="rounded-full border border-neutral-700 px-1.5 text-[10px] text-neutral-500">
-                                {h.project}
-                              </span>
-                            )}
-                          </div>
-                          <div className="truncate text-[11px] text-neutral-500">
-                            {h.username}@{h.host}:{h.port} · {h.auth_type === "password" ? "密码" : "私钥"}
-                          </div>
-                        </div>
-                        <button
-                          onClick={() => openHostForm(h)}
-                          className="rounded px-2 py-1 text-xs text-neutral-400 hover:bg-neutral-800 hover:text-neutral-200"
-                        >
-                          编辑
-                        </button>
-                        <button
-                          onClick={() => void duplicateHost(h.id)}
-                          className="rounded px-2 py-1 text-xs text-neutral-400 hover:bg-neutral-800 hover:text-neutral-200"
-                        >
-                          复制
-                        </button>
-                        <button
-                          onClick={() => {
-                            void (async () => {
-                              const ok = await askConfirm({
-                                title: "删除主机",
-                                message: `确定删除「${h.name}」？`,
-                                okText: "删除",
-                                danger: true,
-                              });
-                              if (ok) void removeHost(h.id);
-                            })();
-                          }}
-                          className="rounded px-2 py-1 text-xs text-neutral-400 hover:bg-neutral-800 hover:text-rose-400"
-                        >
-                          删除
-                        </button>
-                      </li>
-                    ))}
-                    {list.length === 0 && (
-                      <li className="rounded-md border border-dashed border-neutral-800 px-3 py-2 text-center text-[11px] text-neutral-600">
-                        空项目
-                      </li>
-                    )}
-                  </ul>
-                )}
-              </div>
-            );
-          })}
+          {defaultGroup}
+          {tree.map(renderGroup)}
         </div>
       )}
+      <p className="mt-3 text-[11px] text-neutral-600">
+        导出的 JSON 中密码为本机加密后的密文，仅供本机备份，其他设备无法解密。右键项目可重命名、新建子项目或删除。
+      </p>
       <p className="mt-3 text-[11px] text-neutral-600">
         导出的 JSON 中密码为本机加密后的密文，仅供本机备份，其他设备无法解密。右键项目可重命名或删除。
       </p>
@@ -399,7 +439,7 @@ function HostsPane() {
             className="fixed z-50 w-40 rounded-md border border-neutral-700 bg-neutral-900 py-1 shadow-xl"
             style={{ left: menu.x, top: menu.y }}
           >
-            {menu.project === "" ? (
+            {menu.node === null ? (
               <div className="px-3 py-1.5 text-xs text-neutral-600">系统分组，不可修改</div>
             ) : (
               <>
@@ -407,10 +447,10 @@ function HostsPane() {
                   onClick={() => {
                     setMenu(null);
                     void (async () => {
-                      const name = await askText({ title: "重命名项目", initialValue: menu.project });
-                      if (!name || !name.trim() || name.trim() === menu.project) return;
+                      const name = await askText({ title: "重命名项目", initialValue: menu.node!.name });
+                      if (!name || !name.trim() || name.trim() === menu.node!.name) return;
                       try {
-                        await renameProject(menu.project, name.trim());
+                        await renameProject(menu.node!.name, name.trim());
                       } catch (e) {
                         void showMessage({ title: "重命名失败", message: String(e) });
                       }
@@ -424,15 +464,32 @@ function HostsPane() {
                   onClick={() => {
                     setMenu(null);
                     void (async () => {
+                      const name = await askText({ title: `在「${menu.node!.name}」下新建子项目`, placeholder: "子项目名称" });
+                      if (!name || !name.trim()) return;
+                      try {
+                        await createProject(name.trim(), menu.node!.id);
+                      } catch (e) {
+                        void showMessage({ title: "新建子项目失败", message: String(e) });
+                      }
+                    })();
+                  }}
+                  className="block w-full px-3 py-1.5 text-left text-xs text-neutral-300 hover:bg-neutral-800"
+                >
+                  📁 新建子项目
+                </button>
+                <button
+                  onClick={() => {
+                    setMenu(null);
+                    void (async () => {
                       const ok = await askConfirm({
                         title: "删除项目",
-                        message: `删除项目「${menu.project}」？${hosts.some((h) => h.project === menu.project) ? `项目下的主机将移入「${DEFAULT_PROJECT_NAME}」。` : ""}`,
+                        message: `删除项目「${menu.node!.name}」？${hosts.some((h) => h.project === menu.node!.name) ? `项目下的主机将移入「${DEFAULT_PROJECT_NAME}」。` : ""}`,
                         okText: "删除",
                         danger: true,
                       });
                       if (!ok) return;
                       try {
-                        await deleteProject(menu.project);
+                        await deleteProject(menu.node!.name);
                       } catch (e) {
                         void showMessage({ title: "删除失败", message: String(e) });
                       }

@@ -16,6 +16,13 @@ export interface Host {
 /** 新增/编辑主机时的载荷（id 除外） */
 export type NewHost = Omit<Host, "id">;
 
+/** 与 Rust db::Project 对应（项目树节点；parent_id = null 为根级） */
+export interface ProjectInfo {
+  id: number;
+  name: string;
+  parent_id: number | null;
+}
+
 /** 快捷指令（终端一键发送） */
 export interface Snippet {
   id: number;

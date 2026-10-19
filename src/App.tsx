@@ -173,7 +173,7 @@ function Welcome({ hasHosts }: { hasHosts: boolean }) {
     <div className="flex h-full flex-col items-center justify-center text-center text-neutral-600">
       <img src={appIcon} alt="龙鲸X" className="mb-3 h-16 w-16 opacity-90" />
       <p className="text-sm">
-        {hasHosts ? "点击左侧主机开始连接" : "在左侧添加你的第一台服务器"}
+        {hasHosts ? "双击左侧主机开始连接" : "在左侧添加你的第一台服务器"}
       </p>
     </div>
   );

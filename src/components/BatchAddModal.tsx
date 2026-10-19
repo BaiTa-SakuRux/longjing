@@ -1,6 +1,7 @@
 import { useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { useStore, DEFAULT_PROJECT_NAME } from "../store";
+import { buildProjectTree, flattenProjectTree, projectOptionLabel } from "../projects";
 import type { NewHost } from "../types";
 import { showMessage } from "./dialogs";
 
@@ -151,13 +152,11 @@ export function BatchAddModal({ onClose }: { onClose: () => void }) {
                 onChange={(e) => setProject(e.target.value)}
               >
                 <option value="">{DEFAULT_PROJECT_NAME}</option>
-                {projects
-                  .filter((p) => p !== "")
-                  .map((p) => (
-                    <option key={p} value={p}>
-                      {p}
-                    </option>
-                  ))}
+                {flattenProjectTree(buildProjectTree(projects)).map((n) => (
+                  <option key={n.id} value={n.name} title={n.pathLabel}>
+                    {projectOptionLabel(n)}
+                  </option>
+                ))}
               </select>
             </Field>
           </div>

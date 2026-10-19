@@ -59,7 +59,9 @@ pub fn init() -> Result<Connection, AppError> {
             value TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS projects (
-            name TEXT PRIMARY KEY,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
+            parent_id INTEGER,
             created_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
         );
         CREATE TABLE IF NOT EXISTS snippets (
@@ -77,6 +79,25 @@ pub fn init() -> Result<Connection, AppError> {
     )?;
     if has_project == 0 {
         conn.execute("ALTER TABLE hosts ADD COLUMN project TEXT NOT NULL DEFAULT ''", [])?;
+    }
+    // 增量迁移：projects 升级为树形（id + parent_id）；旧表以 name 为主键，按 rowid 平移
+    let has_parent: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('projects') WHERE name = 'parent_id'",
+        [],
+        |r| r.get(0),
+    )?;
+    if has_parent == 0 {
+        conn.execute_batch(
+            "CREATE TABLE projects_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                parent_id INTEGER,
+                created_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+            );
+            INSERT INTO projects_new (id, name, created_at) SELECT rowid, name, created_at FROM projects;
+            DROP TABLE projects;
+            ALTER TABLE projects_new RENAME TO projects;",
+        )?;
     }
     Ok(conn)
 }
@@ -289,6 +310,17 @@ pub fn delete_host(db: tauri::State<'_, Db>, id: i64) -> Result<(), AppError> {
     Ok(())
 }
 
+/// 移动主机到指定项目（侧栏拖拽换组用；project = 项目名，空串 = 默认项目）
+#[tauri::command]
+pub fn move_host(db: tauri::State<'_, Db>, id: i64, project: String) -> Result<(), AppError> {
+    let conn = db.0.lock().unwrap();
+    conn.execute(
+        "UPDATE hosts SET project = ?1 WHERE id = ?2",
+        rusqlite::params![project, id],
+    )?;
+    Ok(())
+}
+
 #[tauri::command]
 pub fn accept_fingerprint(db: tauri::State<'_, Db>, host_id: i64, fingerprint: String) -> Result<(), AppError> {
     let host = {
@@ -316,26 +348,63 @@ pub fn hosts_export(db: tauri::State<'_, Db>, path: String) -> Result<usize, App
     Ok(hosts.len())
 }
 
-/* ---- 项目分组 ---- */
+/* ---- 项目分组（树形，parent_id = 父项目 id；NULL 为根级） ---- */
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Project {
+    pub id: i64,
+    pub name: String,
+    #[serde(default)]
+    pub parent_id: Option<i64>,
+}
 
 #[tauri::command]
-pub fn list_projects(db: tauri::State<'_, Db>) -> Result<Vec<String>, AppError> {
+pub fn list_projects(db: tauri::State<'_, Db>) -> Result<Vec<Project>, AppError> {
     let conn = db.0.lock().unwrap();
-    let mut stmt = conn.prepare("SELECT name FROM projects ORDER BY name COLLATE NOCASE")?;
+    let mut stmt =
+        conn.prepare("SELECT id, name, parent_id FROM projects ORDER BY name COLLATE NOCASE")?;
     let list = stmt
-        .query_map([], |r| r.get::<_, String>(0))?
+        .query_map([], |r| {
+            Ok(Project {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                parent_id: r.get(2)?,
+            })
+        })?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(list)
 }
 
 #[tauri::command]
-pub fn create_project(db: tauri::State<'_, Db>, name: String) -> Result<(), AppError> {
+pub fn create_project(
+    db: tauri::State<'_, Db>,
+    name: String,
+    parent_id: Option<i64>,
+) -> Result<(), AppError> {
     let name = name.trim();
     if name.is_empty() || name == "未分组" {
         return Err(AppError::other("项目名不能为空或「未分组」"));
     }
     let conn = db.0.lock().unwrap();
-    conn.execute("INSERT OR IGNORE INTO projects (name) VALUES (?1)", [name])?;
+    if let Some(pid) = parent_id {
+        let exists: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM projects WHERE id = ?1",
+            [pid],
+            |r| r.get(0),
+        )?;
+        if exists == 0 {
+            return Err(AppError::other("父项目不存在"));
+        }
+    }
+    let dup: i64 =
+        conn.query_row("SELECT COUNT(*) FROM projects WHERE name = ?1", [name], |r| r.get(0))?;
+    if dup > 0 {
+        return Err(AppError::other(format!("项目「{name}」已存在")));
+    }
+    conn.execute(
+        "INSERT INTO projects (name, parent_id) VALUES (?1, ?2)",
+        rusqlite::params![name, parent_id],
+    )?;
     Ok(())
 }
 
@@ -359,11 +428,26 @@ pub fn rename_project(db: tauri::State<'_, Db>, old: String, new: String) -> Res
     Ok(())
 }
 
-/// 删除项目（该项目下的主机移入「未分组」）
+/// 删除项目（该项目下的主机移入「默认项目」；存在子项目时拒绝）
 #[tauri::command]
 pub fn delete_project(db: tauri::State<'_, Db>, name: String) -> Result<(), AppError> {
     let conn = db.0.lock().unwrap();
-    conn.execute("DELETE FROM projects WHERE name = ?1", [&name])?;
+    let id: Option<i64> = conn
+        .query_row("SELECT id FROM projects WHERE name = ?1", [&name], |r| r.get(0))
+        .ok();
+    if let Some(id) = id {
+        let children: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM projects WHERE parent_id = ?1",
+            [id],
+            |r| r.get(0),
+        )?;
+        if children > 0 {
+            return Err(AppError::other(format!(
+                "项目「{name}」下还有 {children} 个子项目，请先删除或移出子项目"
+            )));
+        }
+        conn.execute("DELETE FROM projects WHERE id = ?1", [id])?;
+    }
     conn.execute("UPDATE hosts SET project = '' WHERE project = ?1", [&name])?;
     Ok(())
 }
@@ -384,6 +468,13 @@ pub fn hosts_import(db: tauri::State<'_, Db>, path: String) -> Result<usize, App
         )?;
         if exists > 0 {
             continue;
+        }
+        // 项目名不在项目表时自动补建（旧版导出的 JSON 可能携带未登记的项目）
+        if !h.project.is_empty() {
+            conn.execute(
+                "INSERT OR IGNORE INTO projects (name) VALUES (?1)",
+                [&h.project],
+            )?;
         }
         conn.execute(
             "INSERT INTO hosts (name, host, port, username, auth_type, password, key_path, key_passphrase, project)

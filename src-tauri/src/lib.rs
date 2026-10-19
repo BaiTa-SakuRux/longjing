@@ -30,6 +30,7 @@ pub fn run() {
             db::add_host,
             db::update_host,
             db::delete_host,
+            db::move_host,
             db::accept_fingerprint,
             db::hosts_export,
             db::hosts_import,

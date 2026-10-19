@@ -2,6 +2,7 @@ import { useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { useStore, DEFAULT_PROJECT_NAME } from "../store";
+import { buildProjectTree, flattenProjectTree, projectOptionLabel } from "../projects";
 import type { NewHost } from "../types";
 
 export function HostFormModal() {
@@ -167,13 +168,11 @@ export function HostFormModal() {
               onChange={(e) => setProject(e.target.value)}
             >
               <option value="">{DEFAULT_PROJECT_NAME}</option>
-              {projects
-                .filter((p) => p !== "")
-                .map((p) => (
-                  <option key={p} value={p}>
-                    {p}
-                  </option>
-                ))}
+              {flattenProjectTree(buildProjectTree(projects)).map((n) => (
+                <option key={n.id} value={n.name} title={n.pathLabel}>
+                  {projectOptionLabel(n)}
+                </option>
+              ))}
             </select>
           </Field>
 

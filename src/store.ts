@@ -1,7 +1,7 @@
 import { create } from "zustand";
 import { invoke } from "@tauri-apps/api/core";
 import { Channel } from "@tauri-apps/api/core";
-import type { Host, NewHost, Snippet, Tab, TerminalSettings } from "./types";
+import type { Host, NewHost, ProjectInfo, Snippet, Tab, TerminalSettings } from "./types";
 import { TermSession } from "./term-session";
 import { serializeRecent } from "./terminal-registry";
 import { SYSTEM_PROMPT, type AiConfig, type ApiChatMessage } from "./ai";
@@ -51,7 +51,7 @@ export interface TransferItem {
 
 interface AppState {
   hosts: Host[];
-  projects: string[];
+  projects: ProjectInfo[];
   tabs: Tab[];
   activeTabId: number | null;
   fingerprintPrompt: FingerprintPrompt | null;
@@ -94,7 +94,8 @@ interface AppState {
   skipUnlock: () => void;
   resumePendingConnect: () => void;
   loadProjects: () => Promise<void>;
-  createProject: (name: string) => Promise<void>;
+  /** parentId 传项目 id 创建子项目；省略/null 为根级 */
+  createProject: (name: string, parentId?: number | null) => Promise<void>;
   renameProject: (oldName: string, newName: string) => Promise<void>;
   deleteProject: (name: string) => Promise<void>;
   openHostForm: (editing: Host | null, project?: string) => void;
@@ -102,6 +103,8 @@ interface AppState {
   saveHost: (data: NewHost, id?: number) => Promise<void>;
   removeHost: (id: number) => Promise<void>;
   duplicateHost: (id: number) => Promise<void>;
+  /** 拖拽换组：把主机移到指定项目（空串 = 默认项目） */
+  moveHost: (id: number, project: string) => Promise<void>;
 
   loadSnippets: () => Promise<void>;
   saveSnippet: (name: string, command: string, id?: number) => Promise<void>;
@@ -257,7 +260,18 @@ export const useStore = create<AppState>((set, get) => ({
     try {
       const hosts = await invoke<Host[]>("list_hosts", { master: get().masterPassword });
       set({ hosts });
-      const projects = await invoke<string[]>("list_projects");
+      let projects = await invoke<ProjectInfo[]>("list_projects");
+      // 自愈：主机挂着未登记的项目名（旧版导入遗留）时补建为根级项目
+      const known = new Set(projects.map((p) => p.name));
+      const orphans = [
+        ...new Set(hosts.map((h) => h.project.trim()).filter((k) => k && !known.has(k))),
+      ];
+      for (const name of orphans) {
+        await invoke("create_project", { name, parentId: null }).catch(() => {});
+      }
+      if (orphans.length > 0) {
+        projects = await invoke<ProjectInfo[]>("list_projects");
+      }
       set({ projects });
     } catch (e) {
       console.error("加载主机列表失败", e);
@@ -308,19 +322,19 @@ export const useStore = create<AppState>((set, get) => ({
 
   loadProjects: async () => {
     try {
-      set({ projects: await invoke<string[]>("list_projects") });
+      set({ projects: await invoke<ProjectInfo[]>("list_projects") });
     } catch (e) {
       console.error("加载项目失败", e);
     }
   },
 
-  createProject: async (name) => {
+  createProject: async (name, parentId) => {
     const trimmed = name.trim();
     if (!trimmed) throw new Error("项目名称不能为空");
     if (trimmed === DEFAULT_PROJECT_NAME) {
       throw new Error(`「${DEFAULT_PROJECT_NAME}」为默认项目的保留名，请换一个名称`);
     }
-    await invoke("create_project", { name: trimmed });
+    await invoke("create_project", { name: trimmed, parentId: parentId ?? null });
     await get().loadProjects();
   },
 
@@ -339,6 +353,11 @@ export const useStore = create<AppState>((set, get) => ({
 
   duplicateHost: async (id) => {
     await invoke("duplicate_host", { id });
+    await get().loadHosts();
+  },
+
+  moveHost: async (id, project) => {
+    await invoke("move_host", { id, project });
     await get().loadHosts();
   },
 
