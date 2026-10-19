@@ -13,6 +13,8 @@ export class TermSession {
   private backlog: Uint8Array[] = [];
   private closedListeners = new Set<() => void>();
   private closed = false;
+  /** 连接建立前累计的目标尺寸：握手期间 sessionId 为空，resize 必须记账而非丢弃 */
+  private pendingResize: { cols: number; rows: number } | null = null;
 
   get alive() {
     return this.sessionId !== null && !this.closed;
@@ -66,6 +68,12 @@ export class TermSession {
         master,
         onEvent: channel,
       });
+      // 连接期间 fit 记下的真实尺寸补发给 PTY（connect 传参的 80×24 只是占位）
+      if (this.pendingResize) {
+        const p = this.pendingResize;
+        this.pendingResize = null;
+        this.resize(p.cols, p.rows);
+      }
     } catch (e) {
       const err = parseAppError(e);
       if (
@@ -104,7 +112,10 @@ export class TermSession {
   }
 
   resize(cols: number, rows: number): void {
-    if (!this.alive) return;
+    if (!this.alive) {
+      if (!this.closed) this.pendingResize = { cols, rows };
+      return;
+    }
     invoke("ssh_resize", { sessionId: this.sessionId, cols, rows }).catch(() => {});
   }
 
@@ -113,6 +124,7 @@ export class TermSession {
       invoke("ssh_disconnect", { sessionId: this.sessionId }).catch(() => {});
     }
     this.sessionId = null;
+    this.pendingResize = null;
     this.closed = true;
   }
 

@@ -115,6 +115,21 @@ export function TerminalView({ tab, active }: { tab: Tab; active: boolean }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [active]);
 
+  // 连接建立瞬间 PTY 才真正存在（握手期间的 resize 已由 TermSession 记账补发），再补一次 fit 同步
+  useEffect(() => {
+    if (tab.state !== "connected") return;
+    const container = containerRef.current;
+    const fit = fitRef.current;
+    const term = termRef.current;
+    if (!container || !fit || !term) return;
+    requestAnimationFrame(() => {
+      if (tryFit(fit, container) && stateRef.current === "connected") {
+        tab.session.resize(term.cols, term.rows);
+      }
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tab.state]);
+
   return (
     <div className="relative h-full w-full bg-[#0a0a0a]">
       <div ref={containerRef} className="h-full w-full px-2 py-1" />
