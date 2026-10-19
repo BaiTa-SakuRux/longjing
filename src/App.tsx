@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { getVersion } from "@tauri-apps/api/app";
 import { useStore } from "./store";
 import { HostSidebar } from "./components/HostSidebar";
 import { TabBar } from "./components/TabBar";
@@ -183,6 +184,13 @@ function StatusBar() {
   const tabs = useStore((s) => s.tabs);
   const activeTabId = useStore((s) => s.activeTabId);
   const active = tabs.find((t) => t.id === activeTabId);
+  // 版本号动态读自 tauri.conf.json，提版不再改代码
+  const [version, setVersion] = useState("");
+  useEffect(() => {
+    void getVersion()
+      .then((v) => setVersion(v ?? ""))
+      .catch(() => {});
+  }, []);
   const stateText: Record<string, string> = {
     connecting: "连接中",
     connected: "已连接",
@@ -196,7 +204,7 @@ function StatusBar() {
           ? `${active.host.username}@${active.host.host}:${active.host.port} · ${stateText[active.state] ?? active.state}`
           : "就绪"}
       </span>
-      <span>龙鲸X v0.1.0</span>
+      <span>龙鲸X{version ? ` v${version}` : ""}</span>
     </div>
   );
 }
