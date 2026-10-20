@@ -73,6 +73,7 @@ pub fn run() {
             sftp::transfer_cancel,
             local::local_list,
             local::local_home,
+            local::local_read_text,
             local::local_mkdir,
             local::local_rename,
             local::local_remove,

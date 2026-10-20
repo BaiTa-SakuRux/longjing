@@ -73,3 +73,34 @@ pub fn local_remove(path: String, is_dir: bool) -> Result<(), AppError> {
     }
     Ok(())
 }
+
+#[derive(serde::Serialize)]
+pub struct TextFile {
+    pub content: String,
+    /// 超过 200KB 被截断
+    pub truncated: bool,
+}
+
+/// 读取本地文本文件（AI 附件用）：前 8KB 含 NUL 字节判为二进制拒绝；上限 200KB
+#[tauri::command]
+pub fn local_read_text(path: String) -> Result<TextFile, AppError> {
+    use std::io::Read;
+    const MAX: usize = 200 * 1024;
+    let file = std::fs::File::open(&path)
+        .map_err(|e| AppError::other(format!("无法打开文件：{e}")))?;
+    let mut buf = Vec::new();
+    file.take((MAX + 1) as u64)
+        .read_to_end(&mut buf)
+        .map_err(|e| AppError::other(format!("读取失败：{e}")))?;
+    if buf.first_chunk::<8>().is_some_and(|head| head.contains(&0)) {
+        return Err(AppError::other("疑似二进制文件，仅支持文本内容"));
+    }
+    let truncated = buf.len() > MAX;
+    if truncated {
+        buf.truncate(MAX);
+    }
+    Ok(TextFile {
+        content: String::from_utf8_lossy(&buf).into_owned(),
+        truncated,
+    })
+}

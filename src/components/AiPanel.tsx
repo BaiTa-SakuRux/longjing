@@ -1,7 +1,10 @@
 import { useEffect, useRef, useState } from "react";
 import ReactMarkdown, { Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { useStore, type AiMsg } from "../store";
+import { invoke } from "@tauri-apps/api/core";
+import { open as fileDialog } from "@tauri-apps/plugin-dialog";
+import { useStore, isDangerousCommand, type AiMsg } from "../store";
+import { askConfirm, showMessage } from "./dialogs";
 import { AiSpark } from "./icons";
 
 /** AI 文本段的 Markdown 渲染（GFM 表格/标题/列表/行内代码）；``` 代码块不走这里（由 SHELL 卡片承接） */
@@ -98,15 +101,77 @@ export function AiPanel() {
   const aiSend = useStore((s) => s.aiSend);
   const aiAbort = useStore((s) => s.aiAbort);
   const aiReadTerminals = useStore((s) => s.aiReadTerminals);
+  const aiAttachFiles = useStore((s) => s.aiAttachFiles);
   const tabs = useStore((s) => s.tabs);
   const activeTabId = useStore((s) => s.activeTabId);
   const aiRemoveContextChip = useStore((s) => s.aiRemoveContextChip);
+  const aiClearSession = useStore((s) => s.aiClearSession);
 
   const [input, setInput] = useState("");
   const listRef = useRef<HTMLDivElement>(null);
   const aliveTabs = tabs.filter((t) => t.session.alive);
   const [readOpen, setReadOpen] = useState(false);
   const [readSel, setReadSel] = useState<number[] | null>(null);
+  const [dropHover, setDropHover] = useState(false);
+
+  const FILE_FILTERS = [
+    {
+      name: "脚本与文档",
+      extensions: [
+        "sh", "bash", "zsh", "py", "md", "txt", "yml", "yaml", "toml", "conf",
+        "cfg", "ini", "sql", "json", "service", "env", "ps1", "bat", "cmd",
+        "properties", "xml", "log", "list",
+      ],
+    },
+  ];
+
+  /** 📎 选择本地脚本/文档 → 读文本 → 文件芯片 */
+  const pickAttachments = async () => {
+    const picked = await fileDialog({
+      multiple: true,
+      title: "选择脚本或部署文档",
+      filters: FILE_FILTERS,
+    });
+    if (!picked) return;
+    const paths = Array.isArray(picked) ? picked : [picked];
+    const items: { name: string; text: string }[] = [];
+    for (const p of paths) {
+      try {
+        const t = await invoke<{ content: string; truncated: boolean }>("local_read_text", {
+          path: p,
+        });
+        const name = p.split(/[\\/]/).pop() || p;
+        items.push({
+          name,
+          text: t.truncated ? `${t.content}\n…（超过 200KB 已截断）` : t.content,
+        });
+      } catch (e) {
+        void showMessage({ title: `读取失败：${p.split(/[\\/]/).pop()}`, message: String(e) });
+      }
+    }
+    if (items.length > 0) aiAttachFiles(items);
+  };
+
+  /** 拖拽文件到 AI 面板 → 浏览器 File API 直读内容（无需后端） */
+  const dropAttachments = async (e: React.DragEvent) => {
+    e.preventDefault();
+    setDropHover(false);
+    const files = Array.from(e.dataTransfer.files ?? []);
+    const items: { name: string; text: string }[] = [];
+    for (const f of files) {
+      if (f.size > 200 * 1024) {
+        void showMessage(`「${f.name}」超过 200KB，已跳过`);
+        continue;
+      }
+      const text = await f.text();
+      if (text.slice(0, 8192).includes("\0")) {
+        void showMessage(`「${f.name}」是二进制文件，已跳过`);
+        continue;
+      }
+      items.push({ name: f.name, text });
+    }
+    if (items.length > 0) aiAttachFiles(items);
+  };
   // 仅当用户本就停在底部时才跟随滚动；翻上去阅读/点中间的执行按钮时不再强制拉到底
   const stickToBottomRef = useRef(true);
 
@@ -148,7 +213,23 @@ export function AiPanel() {
     <aside
       className="relative flex shrink-0 flex-col border-l border-neutral-800 bg-neutral-950"
       style={{ width }}
+      onDragOver={(e) => {
+        if (e.dataTransfer.types.includes("Files")) {
+          e.preventDefault();
+          e.dataTransfer.dropEffect = "copy";
+          setDropHover(true);
+        }
+      }}
+      onDragLeave={(e) => {
+        if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setDropHover(false);
+      }}
+      onDrop={(e) => void dropAttachments(e)}
     >
+      {dropHover && (
+        <div className="pointer-events-none absolute inset-0 z-30 flex items-center justify-center border-2 border-dashed border-sky-600 bg-sky-950/50">
+          <p className="text-sm text-sky-300">松开以附加脚本 / 部署文档</p>
+        </div>
+      )}
       <div
         onMouseDown={startResize}
         title="拖拽调整宽度"
@@ -166,6 +247,13 @@ export function AiPanel() {
           </span>
         </span>
         <div className="flex items-center gap-1">
+        <button
+          title="附加脚本或部署文档（也可直接拖入面板）"
+          onClick={() => void pickAttachments()}
+          className="rounded px-1.5 py-0.5 text-xs text-neutral-400 hover:bg-neutral-800 hover:text-neutral-200"
+        >
+          📎
+        </button>
         <div className="relative">
           <button
             title="读取终端最近输出作为上下文（可多选主机）"
@@ -229,6 +317,24 @@ export function AiPanel() {
           )}
         </div>
           <button
+            title="清空会话：移除聊天记录与待执行建议，后端会话重新开始"
+            onClick={() => {
+              void (async () => {
+                const s = useStore.getState();
+                if (s.aiMessages.length === 0 && s.aiContextChips.length === 0) return;
+                const ok = await askConfirm({
+                  title: "清空 AI 会话",
+                  message: "将移除聊天记录、上下文芯片与未执行的命令建议，后端会话重新开始。",
+                  okText: "清空",
+                });
+                if (ok) aiClearSession();
+              })();
+            }}
+            className="rounded px-1.5 py-0.5 text-xs text-neutral-400 hover:bg-neutral-800 hover:text-neutral-200"
+          >
+            🧹
+          </button>
+          <button
             title="AI 设置"
             onClick={() => openSettings("ai")}
             className="rounded px-1.5 py-0.5 text-xs text-neutral-400 hover:bg-neutral-800 hover:text-neutral-200"
@@ -263,7 +369,7 @@ export function AiPanel() {
               className="flex max-w-full items-center gap-1 rounded-full border border-sky-800 bg-sky-900/30 px-2 py-0.5 text-[11px] text-sky-300"
               title={c.text}
             >
-              <span className="max-w-56 truncate">📎 {c.label}</span>
+              <span className="max-w-56 truncate">{c.kind === "file" ? "📄" : "📎"} {c.label}</span>
               <button
                 onClick={() => aiRemoveContextChip(c.id)}
                 className="text-sky-500 hover:text-sky-200"
@@ -285,7 +391,7 @@ export function AiPanel() {
           <div className="pt-8 text-center text-xs leading-relaxed text-neutral-600">
             向龙鲸X描述你的目标，或先「读取终端」再提问。
             <br />
-            它建议的命令会以可一键执行的按钮呈现。
+            也可拖入部署文档 / 脚本，AI 会提炼成可一键执行的命令。
           </div>
         )}
         {aiMessages.map((m) =>
@@ -360,10 +466,14 @@ export function AiPanel() {
 
 function MessageBody({ msg }: { msg: AiMsg }) {
   const aiExecuteCommand = useStore((s) => s.aiExecuteCommand);
+  const editAiCommand = useStore((s) => s.editAiCommand);
   const tabs = useStore((s) => s.tabs);
   const [routes, setRoutes] = useState<Record<number, string>>({});
   const [openIdx, setOpenIdx] = useState<number | null>(null);
   const [popPos, setPopPos] = useState<{ top: number; left: number } | null>(null);
+  // 命令编辑模式：editIdx = 正在编辑的命令下标，editBuf = 编辑缓冲
+  const [editIdx, setEditIdx] = useState<number | null>(null);
+  const [editBuf, setEditBuf] = useState("");
   const aliveTabs = tabs.filter((t) => t.session.alive);
   const segments = splitSegments(msg.content);
 
@@ -407,13 +517,32 @@ function MessageBody({ msg }: { msg: AiMsg }) {
 
   return (
     <>
-      {segments.map((seg, i) =>
-        seg.type === "text" ? (
-          <Md key={i}>{seg.value}</Md>
-        ) : (
-          <div key={i} className="my-1.5 overflow-hidden rounded-md border border-neutral-700">
-            <div className="relative flex items-center justify-between gap-1 bg-neutral-800/80 px-2.5 py-1">
-              <span className="font-mono text-[10px] tracking-wide text-neutral-500">SHELL</span>
+      {segments.map((seg, i) => {
+        if (seg.type === "text") return <Md key={i}>{seg.value}</Md>;
+        const danger = isDangerousCommand(seg.value);
+        return (
+          <div
+            key={i}
+            className={`my-1.5 overflow-hidden rounded-md border ${
+              danger ? "border-rose-600/80 ring-1 ring-rose-900/70" : "border-neutral-700"
+            }`}
+          >
+            <div
+              className={`relative flex items-center justify-between gap-1 px-2.5 py-1 ${
+                danger ? "bg-rose-950/70" : "bg-neutral-800/80"
+              }`}
+            >
+              <div className="flex items-center gap-1.5">
+                <span className={`font-mono text-[10px] tracking-wide ${danger ? "text-rose-400" : "text-neutral-500"}`}>SHELL</span>
+                {danger && (
+                  <span
+                    title="命中高危规则（删除/磁盘/重启等），执行前会弹二次确认"
+                    className="rounded bg-rose-800 px-1.5 py-0.5 text-[10px] font-medium text-rose-100"
+                  >
+                    ⚠ 高危
+                  </span>
+                )}
+              </div>
               <div className="flex items-center gap-1.5">
                 <div className="relative">
                   <button
@@ -487,9 +616,21 @@ function MessageBody({ msg }: { msg: AiMsg }) {
                   )}
                 </div>
                 <button
+                  onClick={() => {
+                    setEditIdx(seg.cmdIndex);
+                    setEditBuf(seg.value);
+                  }}
+                  disabled={msg.executed.includes(seg.cmdIndex)}
+                  title="编辑命令（修改路径、参数后再执行）"
+                  className="shrink-0 whitespace-nowrap rounded px-2 py-0.5 text-[11px] text-neutral-400 hover:bg-neutral-700 hover:text-neutral-200 disabled:opacity-30"
+                >
+                  ✎
+                </button>
+                <button
                   onClick={() => void navigator.clipboard.writeText(seg.value).catch(() => {})}
+                  disabled={editIdx === seg.cmdIndex}
                   title="复制命令"
-                  className="shrink-0 whitespace-nowrap rounded px-2 py-0.5 text-[11px] text-neutral-400 hover:bg-neutral-700 hover:text-neutral-200"
+                  className="shrink-0 whitespace-nowrap rounded px-2 py-0.5 text-[11px] text-neutral-400 hover:bg-neutral-700 hover:text-neutral-200 disabled:opacity-30"
                 >
                   复制
                 </button>
@@ -497,7 +638,7 @@ function MessageBody({ msg }: { msg: AiMsg }) {
                   onClick={() =>
                     aiExecuteCommand(msg.id, seg.cmdIndex, routes[seg.cmdIndex] || undefined)
                   }
-                  disabled={msg.executed.includes(seg.cmdIndex)}
+                  disabled={msg.executed.includes(seg.cmdIndex) || editIdx === seg.cmdIndex}
                   title={`发送到：${routeDetail(seg.cmdIndex)}`}
                   className={`shrink-0 whitespace-nowrap rounded px-2 py-0.5 text-[11px] ${
                     msg.executed.includes(seg.cmdIndex)
@@ -509,12 +650,51 @@ function MessageBody({ msg }: { msg: AiMsg }) {
                 </button>
               </div>
             </div>
-            <pre className="overflow-x-auto bg-neutral-900 px-2.5 py-2 font-mono text-xs text-emerald-300">
-              {seg.value}
-            </pre>
+            {editIdx === seg.cmdIndex ? (
+              <div className={`px-2 py-2 ${danger ? "bg-rose-950/40" : "bg-neutral-900"}`}>
+                <textarea
+                  value={editBuf}
+                  onChange={(e) => setEditBuf(e.target.value)}
+                  rows={Math.max(3, editBuf.split("\n").length + 1)}
+                  autoFocus
+                  className={`w-full resize-y rounded border bg-neutral-950 px-2 py-1.5 font-mono text-xs outline-none ${
+                    isDangerousCommand(editBuf)
+                      ? "border-rose-500 text-rose-300 focus:border-rose-400"
+                      : "border-sky-700 text-emerald-300 focus:border-sky-500"
+                  }`}
+                />
+                <div className="mt-1 flex justify-end gap-1.5">
+                  <button
+                    onClick={() => setEditIdx(null)}
+                    className="rounded bg-neutral-800 px-2 py-1 text-[11px] text-neutral-300 hover:bg-neutral-700"
+                  >
+                    取消
+                  </button>
+                  <button
+                    onClick={() => {
+                      const next = editBuf.replace(/\s+$/, "");
+                      if (!next.trim()) return;
+                      editAiCommand(msg.id, seg.cmdIndex, next);
+                      setEditIdx(null);
+                    }}
+                    className="rounded bg-sky-600 px-2 py-1 text-[11px] text-white hover:bg-sky-500"
+                  >
+                    保存
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <pre
+                className={`overflow-x-auto px-2.5 py-2 font-mono text-xs ${
+                  danger ? "bg-rose-950/50 text-rose-300" : "bg-neutral-900 text-emerald-300"
+                }`}
+              >
+                {seg.value}
+              </pre>
+            )}
           </div>
-        ),
-      )}
+        );
+      })}
     </>
   );
 }

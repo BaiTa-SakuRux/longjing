@@ -657,6 +657,8 @@ async fn run_dsh_attempt(
     let mut linebuf: Vec<u8> = Vec::new();
     let mut finished = false;
     let mut stale = false;
+    let mut got_text = false;
+    let mut err_reason: Option<String> = None;
     loop {
         if cancel.load(Ordering::SeqCst) {
             break;
@@ -678,7 +680,14 @@ async fn run_dsh_attempt(
         while let Some(pos) = linebuf.iter().position(|&b| b == b'\n') {
             let line: Vec<u8> = linebuf.drain(..=pos).collect();
             let line = String::from_utf8_lossy(&line[..line.len() - 1]);
-            let new_sid = process_dsh_line(line.trim(), on_event, &mut finished, &mut stale);
+            let new_sid = process_dsh_line(
+                line.trim(),
+                on_event,
+                &mut finished,
+                &mut stale,
+                &mut got_text,
+                &mut err_reason,
+            );
             // headless 不写 Harness 桌面端的项目注册表，新会话需手动归组，否则桌面端显示「未分组」
             if was_new {
                 if let Some(new_sid) = new_sid {
@@ -702,8 +711,31 @@ async fn run_dsh_attempt(
     if aborted {
         emit(on_event, &json!({"t": "aborted"}));
     } else if finished && !stale {
-        // 正常完成：前端靠 done 提取命令按钮并结束转圈
-        emit(on_event, &json!({"t": "done"}));
+        if let Some(reason) = err_reason.as_deref() {
+            // turn 以错误收场（如凭据缺失、上游拒绝）：透传真实原因，绝不静默渲染空回复
+            emit(on_event, &json!({"t": "error", "v": format!("dsh：{reason}")}));
+        } else if !got_text {
+            // 正常结束但一个字没吐：带上 stderr 尾部帮助定位
+            let tail = err_out.trim();
+            let why = if tail.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "：{}",
+                    tail.chars()
+                        .rev()
+                        .take(300)
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .rev()
+                        .collect::<String>()
+                )
+            };
+            emit(on_event, &json!({"t": "error", "v": format!("dsh 返回空回复{why}")}));
+        } else {
+            // 正常完成：前端靠 done 提取命令按钮并结束转圈
+            emit(on_event, &json!({"t": "done"}));
+        }
     } else if !finished {
         // dsh 提前退出且未完成（如会话失效、参数错误）：给前端终止事件 + 诊断尾部
         let tail = err_out.trim();
@@ -855,6 +887,8 @@ fn process_dsh_line(
     on_event: &IpcChannel,
     finished: &mut bool,
     stale: &mut bool,
+    got_text: &mut bool,
+    err_reason: &mut Option<String>,
 ) -> Option<String> {
     let Ok(v) = serde_json::from_str::<Value>(line) else {
         return None;
@@ -877,6 +911,16 @@ fn process_dsh_line(
             if let Some(s) = stage {
                 emit(&on_event, &json!({"t": "stage", "v": s}));
             }
+            // turn 以错误收场（如凭据缺失、上游 4xx）：记录真实原因，final 空文本时透传前端
+            if v["phase"].as_str() == Some("turn_end")
+                && v["reason"]["kind"].as_str() == Some("error")
+            {
+                if let Some(msg) = v["reason"]["error"]["message"].as_str() {
+                    if err_reason.is_none() {
+                        *err_reason = Some(msg.to_string());
+                    }
+                }
+            }
         }
         Some("thinking") => {
             if let Some(text) = v["text"].as_str() {
@@ -889,6 +933,7 @@ fn process_dsh_line(
             if let Some(text) = v["text"].as_str() {
                 if !text.is_empty() {
                     emit(&on_event, &json!({"t": "delta", "v": text}));
+                    *got_text = true;
                 }
             }
         }

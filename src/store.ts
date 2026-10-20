@@ -37,6 +37,16 @@ export interface AiContextChip {
   id: number;
   label: string;
   text: string;
+  /** terminal = 终端输出（不可信，隔离包裹）；file = 用户主动附加的脚本/部署文档 */
+  kind: "terminal" | "file";
+}
+
+/** 高危命令启发式：命中则执行前弹二次确认（覆盖本地与 AI 提炼的所有命令） */
+const DANGEROUS_RE =
+  /(\brm\s+(-[a-z]*[rf][a-z]*\s|-[a-z]*r[fv]|--recursive))|\bmkfs\b|\bdd\s+[a-z]*\s*if=|>\s*\/dev\/(sd|nvme|vd|hd|xvd)|\bfdisk\b|\bparted\b|\bshutdown\b|\breboot\b|\binit\s+[06]\b|iptables\s+(-F|--flush)|nft\s+flush|:\(\)\s*\{.*\};:|drop\s+database|truncate\s+table|chmod\s+-R\s+0{3,}|\buserdel\b|\bgroupdel\b|\bpasswd\s+(-l|-d)\b/i;
+
+export function isDangerousCommand(cmd: string): boolean {
+  return DANGEROUS_RE.test(cmd);
 }
 
 export interface TransferItem {
@@ -127,6 +137,8 @@ interface AppState {
   acceptFingerprint: () => Promise<void>;
 
   toggleAiPanel: () => void;
+  /** 清空 AI 会话：聊天记录、上下文芯片、后端会话全部重置 */
+  aiClearSession: () => void;
   openSettings: (page?: "appearance" | "hosts" | "ai" | "security" | "snippets") => void;
   closeSettings: () => void;
   toggleSidebar: () => void;
@@ -139,6 +151,10 @@ interface AppState {
   aiSend: (text: string) => Promise<void>;
   aiAbort: () => Promise<void>;
   aiReadTerminals: (tabIds: number[]) => void;
+  /** 附加本地脚本/文档为文件芯片（内容已在前端读取） */
+  aiAttachFiles: (items: { name: string; text: string }[]) => void;
+  /** 编辑 AI 建议的命令：同步改写消息 content 中对应代码块与 commands 项 */
+  editAiCommand: (msgId: number, cmdIndex: number, cmd: string) => void;
   aiExecuteCommand: (msgId: number, cmdIndex: number, route?: string) => void;
   aiRemoveContextChip: (id: number) => void;
 
@@ -510,6 +526,19 @@ export const useStore = create<AppState>((set, get) => ({
 
   toggleAiPanel: () => set((s) => ({ aiPanelOpen: !s.aiPanelOpen })),
 
+  aiClearSession: () => {
+    if (get().aiStreaming) void get().aiAbort();
+    currentChatId = null;
+    // backendSessions 一并清空：下一条消息让 zcode/dsh 走全新会话，不携带旧话题上下文
+    set({
+      aiMessages: [],
+      aiContextChips: [],
+      backendSessions: {},
+      aiStreaming: false,
+      aiStage: null,
+    });
+  },
+
   openSettings: (page) => set((s) => ({ settingsOpen: true, settingsPage: page ?? s.settingsPage })),
   closeSettings: () => set({ settingsOpen: false }),
   toggleSidebar: () => set((s) => ({ sidebarCollapsed: !s.sidebarCollapsed })),
@@ -553,7 +582,14 @@ export const useStore = create<AppState>((set, get) => ({
     }
 
     const chips = get().aiContextChips;
-    const ctx = chips.map((c) => wrapUntrusted(c.label, c.text)).join("\n\n");
+    // 终端输出按不可信数据隔离包裹；文件附件是用户主动提供的内容，按用户材料注入
+    const ctx = chips
+      .map((c) =>
+        c.kind === "file"
+          ? `【用户附件：${c.label}】以下为用户主动提供的文件内容，可从中提炼可执行步骤：\n<file>\n${c.text}\n</file>`
+          : wrapUntrusted(c.label, c.text),
+      )
+      .join("\n\n");
     const userApiContent = ctx ? `${trimmed}\n\n${ctx}` : trimmed;
 
     const backend = get().aiConfig?.backend || "api";
@@ -666,7 +702,7 @@ ${userApiContent}`;
       .filter((t): t is Tab => !!t && t.session.alive)
       .map((t) => ({ tab: t, text: serializeRecent(t.id) }))
       .filter((x): x is { tab: Tab; text: string } => !!x.text)
-      .map((x) => ({ id: nextChipId++, label: `${x.tab.host.name} 终端最近输出`, text: x.text }));
+      .map((x) => ({ id: nextChipId++, label: `${x.tab.host.name} 终端最近输出`, text: x.text, kind: "terminal" as const }));
     if (chips.length === 0) {
       void showMessage("没有可读取的终端输出（会话未连接或暂无输出）");
       return;
@@ -736,18 +772,28 @@ ${userApiContent}`;
           .filter((t) => t.session.alive)
           .map((t) => ({ tab: t, out: serializeRecent(t.id) }))
           .filter((x): x is { tab: Tab; out: string } => !!x.out)
-          .map((x) => ({ id: nextChipId++, label: `${x.tab.host.name} 执行后输出`, text: x.out }));
+          .map((x) => ({ id: nextChipId++, label: `${x.tab.host.name} 执行后输出`, text: x.out, kind: "terminal" as const }));
         if (chips.length > 0) {
           useStore.setState((s) => ({ aiContextChips: [...s.aiContextChips, ...chips] }));
         }
       }, 2000);
     };
 
+    const dangerous = isDangerousCommand(item.cmd);
     if (tag === "@all") {
       void askConfirm({
         title: "广播执行",
-        message: `将向 ${targets.length} 台已连接主机同时发送：\n${item.cmd}`,
+        message: `将向 ${targets.length} 台已连接主机同时发送：\n${item.cmd}${dangerous ? "\n\n⚠️ 该命令命中高危规则（删除/磁盘/重启等），广播后果更重，请再次确认。" : ""}`,
         okText: `发送到 ${targets.length} 台`,
+        danger: true,
+      }).then((ok) => {
+        if (ok) write();
+      });
+    } else if (dangerous) {
+      void askConfirm({
+        title: "高危命令确认",
+        message: `该命令命中高危规则（删除/磁盘/重启等），请确认目标与影响范围：\n${item.cmd}`,
+        okText: "仍要执行",
         danger: true,
       }).then((ok) => {
         if (ok) write();
@@ -756,6 +802,55 @@ ${userApiContent}`;
       write();
     }
   },
+
+  aiAttachFiles: (items) => {
+    const MAX_TOTAL = 300 * 1024;
+    const taken = get().aiContextChips
+      .filter((c) => c.kind === "file")
+      .reduce((n, c) => n + c.text.length, 0);
+    const chips: AiContextChip[] = [];
+    let total = taken;
+    for (const it of items) {
+      const kb = (it.text.length / 1024).toFixed(1);
+      if (total + it.text.length > MAX_TOTAL) {
+        void showMessage(`「${it.name}」未附加：附件总量已超 300KB 上限`);
+        continue;
+      }
+      total += it.text.length;
+      chips.push({
+        id: nextChipId++,
+        label: `${it.name} · ${kb}KB`,
+        text: it.text,
+        kind: "file",
+      });
+    }
+    if (chips.length > 0) {
+      set((s) => ({ aiContextChips: [...s.aiContextChips, ...chips] }));
+    }
+  },
+
+  editAiCommand: (msgId, cmdIndex, cmd) =>
+    set((s) => ({
+      aiMessages: s.aiMessages.map((m) => {
+        if (m.id !== msgId) return m;
+        // 同步改写 content 中第 cmdIndex 个代码块（展示）与 commands 项（执行）
+        const re = /```([a-zA-Z0-9_-]*)\r?\n([\s\S]*?)```/g;
+        let i = -1;
+        let hit = false;
+        const content = m.content.replace(re, (full, lang: string) => {
+          i += 1;
+          if (i !== cmdIndex) return full;
+          hit = true;
+          return "```" + lang + "\n" + cmd + "\n```";
+        });
+        if (!hit) return m;
+        return {
+          ...m,
+          content,
+          commands: m.commands.map((c, idx) => (idx === cmdIndex ? { ...c, cmd } : c)),
+        };
+      }),
+    })),
 
   aiRemoveContextChip: (id) =>
     set((s) => ({ aiContextChips: s.aiContextChips.filter((c) => c.id !== id) })),
