@@ -8,7 +8,7 @@ import { AiSpark, BoltIcon, ServerIcon, ShieldIcon, SlidersIcon } from "./icons"
 import { askConfirm, askText, showMessage } from "./dialogs";
 import { BatchAddModal } from "./BatchAddModal";
 
-type Page = "appearance" | "hosts" | "snippets" | "ai" | "security";
+type Page = "appearance" | "hosts" | "snippets" | "ai" | "security" | "danger";
 
 export function SettingsModal() {
   // 由父组件条件挂载（打开时才 mount），初始页由 store 指定
@@ -22,6 +22,7 @@ export function SettingsModal() {
     snippets: "快捷指令",
     ai: "智能核心",
     security: "隐私加密",
+    danger: "高危命令",
   };
 
   return (
@@ -37,6 +38,7 @@ export function SettingsModal() {
               ["snippets", "快捷指令", <BoltIcon key="i" className="h-4 w-4" />],
               ["ai", "智能核心", <AiSpark key="i" className="h-4 w-4" />],
               ["security", "隐私加密", <ShieldIcon key="i" className="h-4 w-4" />],
+              ["danger", "高危命令", <span key="i">⚠️</span>],
             ] as const
           ).map(([p, label, icon]) => (
             <button
@@ -71,6 +73,7 @@ export function SettingsModal() {
             {page === "snippets" && <SnippetsPane />}
             {page === "ai" && <AiPane />}
             {page === "security" && <SecurityPane />}
+            {page === "danger" && <DangerPane />}
           </div>
         </div>
       </div>
@@ -505,6 +508,119 @@ function HostsPane() {
         </>
       )}
       {batchOpen && <BatchAddModal onClose={() => setBatchOpen(false)} />}
+    </div>
+  );
+}
+
+/* ================= 高危命令 ================= */
+
+const BUILTIN_DANGER_LABELS = [
+  "rm（所有删除，含 rm -v / 无参数）",
+  "truncate（清空文件/表）",
+  "mkfs / dd / fdisk / parted（磁盘）",
+  "> /dev/sd*（裸设备写入）",
+  "shutdown / reboot / init 0|6",
+  "iptables --flush / nft flush",
+  "kill / pkill / killall / fuser",
+  "drop database / truncate table",
+  "chmod -R 000",
+  "userdel / groupdel",
+];
+
+function DangerPane() {
+  const dangerRules = useStore((s) => s.dangerRules);
+  const saveDangerRules = useStore((s) => s.saveDangerRules);
+  const [input, setInput] = useState("");
+  const [saving, setSaving] = useState(false);
+
+  const add = async () => {
+    const v = input.trim();
+    if (!v) return;
+    if (dangerRules.some((r) => r.toLowerCase() === v.toLowerCase())) {
+      void showMessage("该规则已存在");
+      return;
+    }
+    setSaving(true);
+    try {
+      await saveDangerRules([...dangerRules, v]);
+      setInput("");
+    } catch (e) {
+      void showMessage({ title: "保存失败", message: String(e) });
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div className="space-y-4 text-sm">
+      <p className="text-xs leading-relaxed text-neutral-500">
+        命中高危规则的命令在 AI 面板中整卡红色高亮并带 ⚠ 徽标，点击执行时弹出带免责声明的二次确认。对所有来源的命令生效（AI 生成、文档提炼等）。
+      </p>
+
+      <div>
+        <p className="mb-1.5 text-xs text-neutral-400">内置规则（固定生效）</p>
+        <div className="flex flex-wrap gap-1.5">
+          {BUILTIN_DANGER_LABELS.map((t) => (
+            <span
+              key={t}
+              className="rounded-full border border-rose-900/70 bg-rose-950/40 px-2 py-0.5 text-[11px] text-rose-300"
+            >
+              {t}
+            </span>
+          ))}
+        </div>
+      </div>
+
+      <div>
+        <p className="mb-1.5 text-xs text-neutral-400">自定义规则（命令包含片段即命中，不区分大小写）</p>
+        <div className="flex gap-2">
+          <input
+            value={input}
+            onChange={(e) => setInput(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") void add();
+            }}
+            placeholder="如：docker rm、drop table、kubectl delete"
+            className="min-w-0 flex-1 rounded-md border border-neutral-700 bg-neutral-800 px-2.5 py-1.5 text-sm text-neutral-200 outline-none focus:border-sky-500"
+          />
+          <button
+            onClick={() => void add()}
+            disabled={saving || !input.trim()}
+            className="rounded-md bg-sky-600 px-3 py-1.5 text-sm text-white transition-colors hover:bg-sky-500 disabled:opacity-40"
+          >
+            添加
+          </button>
+        </div>
+        <div className="mt-2 space-y-1.5">
+          {dangerRules.length === 0 && (
+            <p className="rounded-md border border-dashed border-neutral-800 px-3 py-2 text-center text-[11px] text-neutral-600">
+              暂无自定义规则
+            </p>
+          )}
+          {dangerRules.map((r) => (
+            <div
+              key={r}
+              className="flex items-center gap-2 rounded-md border border-neutral-800 bg-neutral-950 px-3 py-1.5"
+            >
+              <span className="min-w-0 flex-1 truncate font-mono text-xs text-rose-300">{r}</span>
+              <button
+                onClick={() => void saveDangerRules(dangerRules.filter((x) => x !== r))}
+                className="rounded px-2 py-0.5 text-xs text-neutral-500 hover:bg-neutral-800 hover:text-rose-400"
+              >
+                删除
+              </button>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      <div className="rounded-md border border-neutral-800 bg-neutral-950 px-3 py-2.5">
+        <p className="mb-1 text-xs font-medium text-neutral-400">⚠️ 免责声明</p>
+        <p className="text-[11px] leading-relaxed text-neutral-500">
+          高危命令可能造成不可逆影响（数据删除、服务中断、设备重启等）。龙鲸X
+          仅提供执行前的确认提醒，不校验命令正确性与环境适配性；命令写入终端并执行后的全部结果，由操作者自行承担。
+        </p>
+      </div>
     </div>
   );
 }

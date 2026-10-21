@@ -414,7 +414,30 @@ fn default_backend_cwd() -> std::path::PathBuf {
     crate::db::data_dir()
 }
 
-/// zcode 后端：node zcode.cjs -p <prompt> --json（保留 ZCode 原生工具能力）
+/// Windows 下子进程不分配控制台窗口（打包版为 GUI 进程，否则每次发消息都会弹黑色 cmd 窗）
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// 取诊断文本尾部（最多 300 字符）用于错误消息附注
+fn diag_tail(s: &str) -> String {
+    let tail = s.trim();
+    if tail.is_empty() {
+        return String::new();
+    }
+    format!(
+        "：{}",
+        tail.chars()
+            .rev()
+            .take(300)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<String>()
+    )
+}
+
+/// zcode 后端：node zcode.cjs -p <prompt> --json（保留 ZCode 原生工具能力）。
+/// 空输出类失败（上游瞬时抖动、Turn execution failed 等）自动重试 1 次。
 async fn run_zcode(
     state: Arc<AiState>,
     chat_id: u64,
@@ -437,6 +460,67 @@ async fn run_zcode(
         state.unregister(chat_id);
         return;
     }
+
+    for attempt in 1..=2 {
+        match run_zcode_attempt(
+            &state,
+            chat_id,
+            &config,
+            &prompt,
+            backend_session.as_deref(),
+            &on_event,
+            &cancel,
+        )
+        .await
+        {
+            ZcodeOutcome::Completed => return,
+            ZcodeOutcome::Aborted => {
+                emit(&on_event, &json!({"t": "aborted"}));
+                return;
+            }
+            outcome => {
+                if attempt == 1 {
+                    emit(
+                        &on_event,
+                        &json!({"t": "stage", "v": "上次调用失败，正在自动重试…"}),
+                    );
+                    continue;
+                }
+                let (base, tail) = match outcome {
+                    ZcodeOutcome::FailedIo(e, tail) => (e, tail),
+                    ZcodeOutcome::FailedEmptyResponse(tail) => ("zcode 返回了空回答".into(), tail),
+                    ZcodeOutcome::FailedEmptyStdout(tail) => ("zcode 无输出".into(), tail),
+                    _ => ("zcode 无输出".into(), String::new()),
+                };
+                emit(
+                    &on_event,
+                    &json!({"t": "error", "v": format!("{base}{}", diag_tail(&tail))}),
+                );
+                return;
+            }
+        }
+    }
+}
+
+/// 单次尝试的结局；Failed* 仅在重试耗尽后由外层发终局错误
+enum ZcodeOutcome {
+    Completed,
+    Aborted,
+    FailedIo(String, String),
+    FailedEmptyResponse(String),
+    FailedEmptyStdout(String),
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_zcode_attempt(
+    state: &Arc<AiState>,
+    chat_id: u64,
+    config: &AiConfig,
+    prompt: &str,
+    backend_session: Option<&str>,
+    on_event: &IpcChannel,
+    cancel: &Arc<AtomicBool>,
+) -> ZcodeOutcome {
     let cwd = if config.zcode_cwd.trim().is_empty() {
         default_backend_cwd()
     } else {
@@ -446,11 +530,13 @@ async fn run_zcode(
     let mut cmd = Command::new("node");
     cmd.arg(&config.zcode_path)
         .arg("-p")
-        .arg(&prompt)
+        .arg(prompt)
         .arg("--json")
         .current_dir(&cwd)
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null());
+        .stderr(std::process::Stdio::piped());
+    #[cfg(windows)]
+    cmd.creation_flags(CREATE_NO_WINDOW);
     if let Some(sid) = backend_session.filter(|s| !s.trim().is_empty()) {
         cmd.arg("--resume").arg(sid);
     }
@@ -461,16 +547,35 @@ async fn run_zcode(
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
+            // 启动失败无重试意义（路径/环境问题），错误已发，按终局处理
             emit(
-                &on_event,
+                on_event,
                 &json!({"t": "error", "v": format!("启动 zcode 失败：{e}")}),
             );
             state.unregister(chat_id);
-            return;
+            return ZcodeOutcome::Completed;
         }
     };
     let mut stdout = child.stdout.take().expect("stdout piped");
+    let mut stderr = child.stderr.take().expect("stderr piped");
     let child = state.register_child(chat_id, child);
+    // 后台收集 stderr：zcode 失败原因通常写在这里（此前被丢弃，只能报「无输出」）
+    let err_task = tokio::spawn(async move {
+        let mut out: Vec<u8> = Vec::new();
+        let mut b = [0u8; 1024];
+        loop {
+            match stderr.read(&mut b).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    out.extend_from_slice(&b[..n]);
+                    if out.len() > 8192 {
+                        out.drain(..out.len() - 4096);
+                    }
+                }
+            }
+        }
+        String::from_utf8_lossy(&out).into_owned()
+    });
 
     let mut out = String::new();
     let mut buf = vec![0u8; 65536];
@@ -495,14 +600,13 @@ async fn run_zcode(
     let _ = child.lock().await.kill().await;
     let aborted = cancel.load(Ordering::SeqCst);
     state.unregister(chat_id);
+    let stderr_tail = err_task.await.unwrap_or_default();
 
     if aborted {
-        emit(&on_event, &json!({"t": "aborted"}));
-        return;
+        return ZcodeOutcome::Aborted;
     }
     if let Some(e) = io_err {
-        emit(&on_event, &json!({"t": "error", "v": e}));
-        return;
+        return ZcodeOutcome::FailedIo(e, stderr_tail);
     }
 
     // 输出为完整 JSON（可能带首尾杂讯，取第一个 { 到最后一个 }）
@@ -513,26 +617,25 @@ async fn run_zcode(
     match parsed {
         Some(v) => {
             if let Some(sid) = v["sessionId"].as_str() {
-                emit(&on_event, &json!({"t": "session", "v": sid}));
+                emit(on_event, &json!({"t": "session", "v": sid}));
             }
             match v["response"].as_str() {
                 Some(text) if !text.is_empty() => {
-                    emit(&on_event, &json!({"t": "delta", "v": text}));
-                    emit(&on_event, &json!({"t": "done"}));
+                    emit(on_event, &json!({"t": "delta", "v": text}));
+                    emit(on_event, &json!({"t": "done"}));
+                    ZcodeOutcome::Completed
                 }
-                _ => emit(
-                    &on_event,
-                    &json!({"t": "error", "v": "zcode 返回了空回答"}),
-                ),
+                _ => ZcodeOutcome::FailedEmptyResponse(stderr_tail),
             }
         }
         None => {
             let raw = out.trim();
             if raw.is_empty() {
-                emit(&on_event, &json!({"t": "error", "v": "zcode 无输出"}));
+                ZcodeOutcome::FailedEmptyStdout(stderr_tail)
             } else {
-                emit(&on_event, &json!({"t": "delta", "v": raw}));
-                emit(&on_event, &json!({"t": "done"}));
+                emit(on_event, &json!({"t": "delta", "v": raw}));
+                emit(on_event, &json!({"t": "done"}));
+                ZcodeOutcome::Completed
             }
         }
     }
@@ -615,6 +718,8 @@ async fn run_dsh_attempt(
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
+    #[cfg(windows)]
+    cmd.creation_flags(CREATE_NO_WINDOW);
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,
@@ -716,44 +821,14 @@ async fn run_dsh_attempt(
             emit(on_event, &json!({"t": "error", "v": format!("dsh：{reason}")}));
         } else if !got_text {
             // 正常结束但一个字没吐：带上 stderr 尾部帮助定位
-            let tail = err_out.trim();
-            let why = if tail.is_empty() {
-                String::new()
-            } else {
-                format!(
-                    "：{}",
-                    tail.chars()
-                        .rev()
-                        .take(300)
-                        .collect::<Vec<_>>()
-                        .into_iter()
-                        .rev()
-                        .collect::<String>()
-                )
-            };
-            emit(on_event, &json!({"t": "error", "v": format!("dsh 返回空回复{why}")}));
+            emit(on_event, &json!({"t": "error", "v": format!("dsh 返回空回复{}", diag_tail(&err_out))}));
         } else {
             // 正常完成：前端靠 done 提取命令按钮并结束转圈
             emit(on_event, &json!({"t": "done"}));
         }
     } else if !finished {
         // dsh 提前退出且未完成（如会话失效、参数错误）：给前端终止事件 + 诊断尾部
-        let tail = err_out.trim();
-        let why = if tail.is_empty() {
-            String::new()
-        } else {
-            format!(
-                "：{}",
-                tail.chars()
-                    .rev()
-                    .take(300)
-                    .collect::<Vec<_>>()
-                    .into_iter()
-                    .rev()
-                    .collect::<String>()
-            )
-        };
-        emit(on_event, &json!({"t": "error", "v": format!("dsh 异常退出{why}")}));
+        emit(on_event, &json!({"t": "error", "v": format!("dsh 异常退出{}", diag_tail(&err_out))}));
     }
     (finished, aborted, stale)
 }

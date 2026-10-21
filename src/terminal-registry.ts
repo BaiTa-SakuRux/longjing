@@ -11,16 +11,25 @@ export function unregisterTerminal(tabId: number): void {
   registry.delete(tabId);
 }
 
-/** 序列化某个终端最近 N 行（含 scrollback），末尾空行裁掉 */
-export function serializeRecent(tabId: number, maxLines = 400): string | null {
+/** 序列化某个终端最近 N 行（含 scrollback），末尾空行裁掉；连续重复行折叠为「[× N]」防刷屏淹没信号 */
+export function serializeRecent(tabId: number, maxLines = 1200): string | null {
   const term = registry.get(tabId);
   if (!term) return null;
   const buf = term.buffer.active;
   const total = buf.length;
-  const lines: string[] = [];
+  const raw: string[] = [];
   for (let i = Math.max(0, total - maxLines); i < total; i++) {
     const line = buf.getLine(i);
-    if (line) lines.push(line.translateToString(true));
+    if (line) raw.push(line.translateToString(true));
+  }
+  const lines: string[] = [];
+  let i = 0;
+  while (i < raw.length) {
+    let j = i;
+    while (j + 1 < raw.length && raw[j + 1] === raw[i]) j += 1;
+    const dup = j - i + 1;
+    lines.push(dup > 1 ? `${raw[i]}    [× ${dup}]` : raw[i]);
+    i = j + 1;
   }
   return lines.join("\n").replace(/\n+$/, "");
 }

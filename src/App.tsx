@@ -82,6 +82,7 @@ export default function App() {
   const loadAiConfig = useStore((s) => s.loadAiConfig);
   const loadTerminalSettings = useStore((s) => s.loadTerminalSettings);
   const loadSecurityStatus = useStore((s) => s.loadSecurityStatus);
+  const loadDangerRules = useStore((s) => s.loadDangerRules);
   const hosts = useStore((s) => s.hosts);
   const tabs = useStore((s) => s.tabs);
   const activeTabId = useStore((s) => s.activeTabId);
@@ -97,7 +98,8 @@ export default function App() {
     void loadAiConfig();
     void loadTerminalSettings();
     void loadSecurityStatus();
-  }, [loadHosts, loadAiConfig, loadTerminalSettings, loadSecurityStatus]);
+    void loadDangerRules();
+  }, [loadHosts, loadAiConfig, loadTerminalSettings, loadSecurityStatus, loadDangerRules]);
 
   // 文件侧栏宽度（拖拽分隔条调整）
   const [filesWidth, setFilesWidth] = useState(440);
