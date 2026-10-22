@@ -102,6 +102,8 @@
 **高危命令页**：内置规则固定生效，自定义片段自由增删（命令包含即命中，持久化保存）；
 高危 / 广播执行的确认弹窗均附免责声明。
 
+![高危命令设置页](docs/screenshots/settings-danger.png)
+
 ## 🔧 技术栈
 
 Tauri 2 · Rust（russh、ring）· React 19 · TypeScript · xterm.js 6 · Tailwind CSS 4
